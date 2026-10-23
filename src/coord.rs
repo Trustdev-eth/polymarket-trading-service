@@ -2,7 +2,7 @@
 //! Live intents go to the UK fleet as tenant_id + size + side — no keys.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use futures_util::TryStreamExt;
@@ -12,14 +12,58 @@ use mm_engine::{
 };
 use mongodb::bson::{doc, DateTime as BsonDateTime};
 use mongodb::{Client, Collection, Database};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 
 use crate::allocator::{allocate, wave_budget, Candidate, MIN_SIZE};
 use crate::config::{HOUSE_EMAIL, MIN_BASE, PAPER_CASH};
 use crate::db::now_ms;
 use crate::mdhub::{self, MdHub};
-use crate::models::{FillRow, FleetMsg, FleetTake, Member, Snap, Tick, WindowResult};
+use crate::models::{FillRow, FleetMsg, FleetReply, FleetTake, Member, Snap, Tick, WindowResult};
+
+struct FleetConn {
+    w: OwnedWriteHalf,
+    r: Lines<BufReader<OwnedReadHalf>>,
+}
+
+struct FleetHello {
+    yes_id: String,
+    no_id: String,
+    tick: f64,
+    fee_bps: u32,
+    neg_risk: bool,
+}
+
+impl FleetHello {
+    fn from_market(market: &mm_md::ResolvedMarket) -> Self {
+        Self {
+            yes_id: market.yes_id_dec.clone(),
+            no_id: market.no_id_dec.clone(),
+            tick: market.info.tick_size,
+            fee_bps: market.info.fee_bps,
+            neg_risk: market.info.neg_risk,
+        }
+    }
+
+    fn msg(&self) -> FleetMsg {
+        FleetMsg::Hello {
+            yes_id: self.yes_id.clone(),
+            no_id: self.no_id.clone(),
+            tick: self.tick,
+            fee_bps: self.fee_bps,
+            neg_risk: self.neg_risk,
+        }
+    }
+}
+
+struct LivePending {
+    email: String,
+    token: TokenRef,
+    requested: f64,
+    px: f64,
+    kind: &'static str,
+}
 
 pub struct CoordArgs {
     pub mongo_uri: String,
@@ -107,20 +151,9 @@ pub async fn run(args: CoordArgs) -> Result<()> {
     .await?;
     let mut assets_tx = hub.assets_tx;
 
-    let mut fleet = connect_fleet(&args.fleet_addr, &args.fleet_token).await;
-    if let Some(s) = fleet.as_mut() {
-        send_msg(
-            s,
-            &FleetMsg::Hello {
-                yes_id: market.yes_id_dec.clone(),
-                no_id: market.no_id_dec.clone(),
-                tick: market.info.tick_size,
-                fee_bps: market.info.fee_bps,
-                neg_risk: market.info.neg_risk,
-            },
-        )
-        .await;
-    }
+    let mut hello = FleetHello::from_market(&market);
+    let mut fleet = connect_fleet(&args.fleet_addr, &args.fleet_token, &hello).await;
+    let mut last_fleet_try = now_ms() as u64;
 
     let mut tenants: HashMap<String, Tenant> = HashMap::new();
     let mut last_sync = 0u64;
@@ -137,6 +170,15 @@ pub async fn run(args: CoordArgs) -> Result<()> {
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 sync_if_due(&members, &mut tenants, &mut last_sync).await;
                 let now = now_ms() as u64;
+                ensure_fleet(
+                    &mut fleet,
+                    &mut last_fleet_try,
+                    now,
+                    &args.fleet_addr,
+                    &args.fleet_token,
+                    &hello,
+                )
+                .await;
                 maybe_roll(
                     &mut house,
                     &mut tenants,
@@ -145,6 +187,8 @@ pub async fn run(args: CoordArgs) -> Result<()> {
                     &mut assets_tx,
                     &mut settled,
                     &mut last_roll_try,
+                    &mut fleet,
+                    &mut hello,
                     &args.base,
                     args.mins,
                     now,
@@ -160,6 +204,15 @@ pub async fn run(args: CoordArgs) -> Result<()> {
             Err(_) => break,
         };
         let now = now_ms() as u64;
+        ensure_fleet(
+            &mut fleet,
+            &mut last_fleet_try,
+            now,
+            &args.fleet_addr,
+            &args.fleet_token,
+            &hello,
+        )
+        .await;
         let ev = dated.event;
         if let Event::Depth(d) = &ev {
             yes_bid_sz = d.bids[0].size;
@@ -219,6 +272,7 @@ pub async fn run(args: CoordArgs) -> Result<()> {
                 }
             }
             let mut live_takes = Vec::new();
+            let mut pending: HashMap<(String, u64), LivePending> = HashMap::new();
             let mut fill_rows = Vec::new();
             let mut member_sets = Vec::new();
             for sh in &alloc.shares {
@@ -227,21 +281,6 @@ pub async fn run(args: CoordArgs) -> Result<()> {
                 };
                 t.deficit = 0;
                 t.last_alloc = format!("{:.1} / {:.1}", sh.size, sh.requested);
-                apply_buy(&mut t.position, token, px, sh.size, fee_bps);
-                fill_rows.push(FillRow {
-                    email: t.email.clone(),
-                    ts_ms: now as i64,
-                    token: if long { "Yes".into() } else { "No".into() },
-                    size: sh.size,
-                    px,
-                    kind: "taker".into(),
-                    paper: t.paper || !t.live,
-                });
-                member_sets.push((
-                    t.email.clone(),
-                    t.deficit as i32,
-                    t.last_alloc.clone(),
-                ));
                 if t.live {
                     t.seq += 1;
                     live_takes.push(FleetTake {
@@ -253,9 +292,46 @@ pub async fn run(args: CoordArgs) -> Result<()> {
                         post_only: false,
                         seq: t.seq,
                     });
+                    pending.insert(
+                        (t.email.clone(), t.seq),
+                        LivePending {
+                            email: t.email.clone(),
+                            token,
+                            requested: sh.size,
+                            px,
+                            kind: "taker",
+                        },
+                    );
+                } else {
+                    apply_buy(&mut t.position, token, px, sh.size, fee_bps);
+                    fill_rows.push(FillRow {
+                        email: t.email.clone(),
+                        ts_ms: now as i64,
+                        token: if long { "Yes".into() } else { "No".into() },
+                        size: sh.size,
+                        px,
+                        kind: "taker".into(),
+                        paper: true,
+                    });
+                    member_sets.push((
+                        t.email.clone(),
+                        t.deficit as i32,
+                        t.last_alloc.clone(),
+                    ));
                 }
             }
-            send_wave(fleet.as_mut(), live_takes).await;
+            let replies = send_wave(&mut fleet, live_takes).await;
+            book_live_replies(
+                &mut tenants,
+                &fills,
+                &members,
+                pending,
+                replies,
+                fee_bps,
+                now,
+                true,
+            )
+            .await;
             for row in fill_rows {
                 let _ = fills.insert_one(row, None).await;
             }
@@ -274,6 +350,7 @@ pub async fn run(args: CoordArgs) -> Result<()> {
             let px = px_ticks as f64 / 100.0;
             let fee_bps = house.state.info.as_ref().map(|i| i.fee_bps).unwrap_or(0);
             let mut live_takes = Vec::new();
+            let mut pending: HashMap<(String, u64), LivePending> = HashMap::new();
             let mut fill_rows = Vec::new();
             for t in tenants.values_mut() {
                 if !t.hedge {
@@ -284,20 +361,6 @@ pub async fn run(args: CoordArgs) -> Result<()> {
                     continue;
                 }
                 let size = need.min(t.base_amount);
-                apply_buy(&mut t.position, token, px, size, fee_bps);
-                fill_rows.push(FillRow {
-                    email: t.email.clone(),
-                    ts_ms: now as i64,
-                    token: if token == TokenRef::Yes {
-                        "Yes".into()
-                    } else {
-                        "No".into()
-                    },
-                    size,
-                    px,
-                    kind: "hedge".into(),
-                    paper: t.paper || !t.live,
-                });
                 if t.live {
                     t.seq += 1;
                     live_takes.push(FleetTake {
@@ -313,9 +376,45 @@ pub async fn run(args: CoordArgs) -> Result<()> {
                         post_only: true,
                         seq: t.seq,
                     });
+                    pending.insert(
+                        (t.email.clone(), t.seq),
+                        LivePending {
+                            email: t.email.clone(),
+                            token,
+                            requested: size,
+                            px,
+                            kind: "hedge",
+                        },
+                    );
+                } else {
+                    apply_buy(&mut t.position, token, px, size, fee_bps);
+                    fill_rows.push(FillRow {
+                        email: t.email.clone(),
+                        ts_ms: now as i64,
+                        token: if token == TokenRef::Yes {
+                            "Yes".into()
+                        } else {
+                            "No".into()
+                        },
+                        size,
+                        px,
+                        kind: "hedge".into(),
+                        paper: true,
+                    });
                 }
             }
-            send_wave(fleet.as_mut(), live_takes).await;
+            let replies = send_wave(&mut fleet, live_takes).await;
+            book_live_replies(
+                &mut tenants,
+                &fills,
+                &members,
+                pending,
+                replies,
+                fee_bps,
+                now,
+                false,
+            )
+            .await;
             for row in fill_rows {
                 let _ = fills.insert_one(row, None).await;
             }
@@ -334,6 +433,8 @@ pub async fn run(args: CoordArgs) -> Result<()> {
             &mut assets_tx,
             &mut settled,
             &mut last_roll_try,
+            &mut fleet,
+            &mut hello,
             &args.base,
             args.mins,
             now,
@@ -445,6 +546,8 @@ async fn maybe_roll(
     assets_tx: &mut tokio::sync::watch::Sender<(String, String)>,
     settled: &mut HashSet<String>,
     last_try: &mut u64,
+    fleet: &mut Option<FleetConn>,
+    hello: &mut FleetHello,
     base: &str,
     mins: u32,
     now: u64,
@@ -471,7 +574,13 @@ async fn maybe_roll(
     match crate::quotes::current_market(base, mins).await {
         Ok(market) => {
             let _ = house.on_event(Event::LoadContract(market.info.clone()), now);
-            let _ = assets_tx.send((market.yes_id_dec, market.no_id_dec));
+            let _ = assets_tx.send((market.yes_id_dec.clone(), market.no_id_dec.clone()));
+            *hello = FleetHello::from_market(&market);
+            if let Some(c) = fleet.as_mut() {
+                if !send_msg(c, &hello.msg()).await {
+                    *fleet = None;
+                }
+            }
             tracing::info!(slug = %market.slug, k = market.info.k_t, "rolled window");
         }
         Err(e) => tracing::warn!(error = %e, "next contract"),
@@ -612,17 +721,27 @@ async fn refresh_tenants(
     Ok(())
 }
 
-async fn connect_fleet(addr: &str, token: &str) -> Option<TcpStream> {
+async fn connect_fleet(addr: &str, token: &str, hello: &FleetHello) -> Option<FleetConn> {
     if addr.is_empty() {
         return None;
     }
     match TcpStream::connect(addr).await {
-        Ok(mut s) => {
-            if !token.is_empty() {
-                send_msg(&mut s, &FleetMsg::Auth { token: token.into() }).await;
+        Ok(s) => {
+            let _ = s.set_nodelay(true);
+            let (r, w) = s.into_split();
+            let mut c = FleetConn {
+                w,
+                r: BufReader::new(r).lines(),
+            };
+            if !token.is_empty() && !send_msg(&mut c, &FleetMsg::Auth { token: token.into() }).await
+            {
+                return None;
+            }
+            if !send_msg(&mut c, &hello.msg()).await {
+                return None;
             }
             tracing::info!(%addr, "fleet connected");
-            Some(s)
+            Some(c)
         }
         Err(e) => {
             tracing::warn!(error=%e, "fleet offline — paper only");
@@ -631,20 +750,197 @@ async fn connect_fleet(addr: &str, token: &str) -> Option<TcpStream> {
     }
 }
 
-async fn send_msg(s: &mut TcpStream, msg: &FleetMsg) {
-    if let Ok(line) = serde_json::to_string(msg) {
-        let mut buf = line.into_bytes();
-        buf.push(b'\n');
-        let _ = s.write_all(&buf).await;
+async fn ensure_fleet(
+    fleet: &mut Option<FleetConn>,
+    last_try: &mut u64,
+    now: u64,
+    addr: &str,
+    token: &str,
+    hello: &FleetHello,
+) {
+    if fleet.is_some() {
+        return;
+    }
+    if now.saturating_sub(*last_try) < 3_000 {
+        return;
+    }
+    *last_try = now;
+    *fleet = connect_fleet(addr, token, hello).await;
+}
+
+async fn send_msg(c: &mut FleetConn, msg: &FleetMsg) -> bool {
+    let Ok(line) = serde_json::to_string(msg) else {
+        return false;
+    };
+    let mut buf = line.into_bytes();
+    buf.push(b'\n');
+    if c.w.write_all(&buf).await.is_err() {
+        tracing::warn!("fleet write failed");
+        return false;
+    }
+    true
+}
+
+async fn send_wave(fleet: &mut Option<FleetConn>, takes: Vec<FleetTake>) -> Vec<FleetReply> {
+    let n = takes.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let Some(c) = fleet.as_mut() else {
+        tracing::warn!(n, "fleet down — skip live wave");
+        return Vec::new();
+    };
+    tracing::info!(n, "live wave fan-out");
+    if !send_msg(c, &FleetMsg::Wave { takes }).await {
+        *fleet = None;
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(n);
+    let deadline = Instant::now() + Duration::from_secs(12);
+    for _ in 0..n {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            tracing::warn!("fleet reply deadline");
+            *fleet = None;
+            break;
+        }
+        match tokio::time::timeout(left.min(Duration::from_secs(8)), c.r.next_line()).await {
+            Ok(Ok(Some(line))) => match serde_json::from_str::<FleetReply>(&line) {
+                Ok(r) => out.push(r),
+                Err(e) => tracing::warn!(error=%e, "bad fleet reply"),
+            },
+            Ok(Ok(None)) => {
+                tracing::warn!("fleet closed");
+                *fleet = None;
+                break;
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error=%e, "fleet read");
+                *fleet = None;
+                break;
+            }
+            Err(_) => {
+                tracing::warn!("fleet reply timeout");
+                *fleet = None;
+                break;
+            }
+        }
+    }
+    out
+}
+
+async fn book_live_replies(
+    tenants: &mut HashMap<String, Tenant>,
+    fills: &Collection<FillRow>,
+    members: &Collection<Member>,
+    mut pending: HashMap<(String, u64), LivePending>,
+    replies: Vec<FleetReply>,
+    fee_bps: u32,
+    now: u64,
+    bump_deficit_on_miss: bool,
+) {
+    for r in replies {
+        match r {
+            FleetReply::Fill {
+                email,
+                seq,
+                size,
+                px,
+            } => {
+                let key = (email.clone(), seq);
+                let Some(p) = pending.remove(&key) else {
+                    continue;
+                };
+                if size <= 1e-9 {
+                    miss_live(tenants, members, &p, "unfilled", bump_deficit_on_miss).await;
+                    continue;
+                }
+                let Some(t) = tenants.get_mut(&email) else {
+                    continue;
+                };
+                let fill_px = if px > 1e-9 { px } else { p.px };
+                apply_buy(&mut t.position, p.token, fill_px, size, fee_bps);
+                t.last_alloc = format!("{:.1} / {:.1}", size, p.requested);
+                let last_alloc = t.last_alloc.clone();
+                let _ = fills
+                    .insert_one(
+                        FillRow {
+                            email: email.clone(),
+                            ts_ms: now as i64,
+                            token: if p.token == TokenRef::Yes {
+                                "Yes".into()
+                            } else {
+                                "No".into()
+                            },
+                            size,
+                            px: fill_px,
+                            kind: p.kind.into(),
+                            paper: false,
+                        },
+                        None,
+                    )
+                    .await;
+                let _ = members
+                    .update_one(
+                        doc! { "email": email },
+                        doc! { "$set": { "lastAlloc": last_alloc, "deficit": 0 } },
+                        None,
+                    )
+                    .await;
+            }
+            FleetReply::Ack { email, seq, ok } => {
+                let key = (email, seq);
+                if let Some(p) = pending.remove(&key) {
+                    if !ok || bump_deficit_on_miss {
+                        miss_live(
+                            tenants,
+                            members,
+                            &p,
+                            if ok { "unfilled" } else { "nack" },
+                            bump_deficit_on_miss,
+                        )
+                        .await;
+                    }
+                }
+            }
+            FleetReply::Reject {
+                email,
+                seq,
+                reason,
+            } => {
+                let key = (email, seq);
+                if let Some(p) = pending.remove(&key) {
+                    miss_live(tenants, members, &p, &reason, bump_deficit_on_miss).await;
+                }
+            }
+        }
+    }
+    for p in pending.into_values() {
+        miss_live(tenants, members, &p, "no-reply", bump_deficit_on_miss).await;
     }
 }
 
-async fn send_wave(fleet: Option<&mut TcpStream>, takes: Vec<FleetTake>) {
-    if takes.is_empty() {
+async fn miss_live(
+    tenants: &mut HashMap<String, Tenant>,
+    members: &Collection<Member>,
+    p: &LivePending,
+    reason: &str,
+    bump_deficit: bool,
+) {
+    let Some(t) = tenants.get_mut(&p.email) else {
         return;
+    };
+    t.last_alloc = format!("0 / {:.1} ({reason})", p.requested);
+    if bump_deficit {
+        t.deficit = t.deficit.saturating_add(1);
     }
-    if let Some(s) = fleet {
-        tracing::info!(n = takes.len(), "live wave fan-out");
-        send_msg(s, &FleetMsg::Wave { takes }).await;
-    }
+    let last_alloc = t.last_alloc.clone();
+    let deficit = t.deficit as i32;
+    let _ = members
+        .update_one(
+            doc! { "email": &p.email },
+            doc! { "$set": { "deficit": deficit, "lastAlloc": last_alloc } },
+            None,
+        )
+        .await;
 }

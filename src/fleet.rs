@@ -57,9 +57,10 @@ pub async fn run(args: FleetArgs) -> Result<()> {
         let (sock, peer) = listener.accept().await?;
         tracing::info!(%peer, "coordinator connected");
         let args = clone_args(&args);
+        let members = members.clone();
         let mut slots = load_slots(&members, &args).await.unwrap_or_default();
         tokio::spawn(async move {
-            if let Err(e) = handle(sock, args, &mut slots).await {
+            if let Err(e) = handle(sock, args, members, &mut slots).await {
                 tracing::warn!(error=%e, "fleet session");
             }
         });
@@ -155,7 +156,12 @@ async fn load_slots(col: &Collection<Member>, args: &FleetArgs) -> Result<SlotMa
     Ok(out)
 }
 
-async fn handle(sock: TcpStream, args: FleetArgs, slots: &mut SlotMap) -> Result<()> {
+async fn handle(
+    sock: TcpStream,
+    args: FleetArgs,
+    members: Collection<Member>,
+    slots: &mut SlotMap,
+) -> Result<()> {
     let (r, mut w) = sock.into_split();
     let mut lines = BufReader::new(r).lines();
     let mut authed = args.token.is_empty();
@@ -236,6 +242,19 @@ async fn handle(sock: TcpStream, args: FleetArgs, slots: &mut SlotMap) -> Result
             FleetMsg::Wave { takes } => {
                 if !authed {
                     continue;
+                }
+                match load_slots(&members, &args).await {
+                    Ok(fresh) => {
+                        *slots = fresh;
+                        if let Some(mkt) = hello.as_ref() {
+                            for s in slots.values() {
+                                let mut s = s.lock().await;
+                                s.clob.set_market(mkt.clone());
+                            }
+                        }
+                        tracing::info!(n = slots.len(), "fleet keys reloaded");
+                    }
+                    Err(e) => tracing::warn!(error=%e, "fleet key reload"),
                 }
                 tracing::info!(n = takes.len(), "fan-out live POSTs");
                 fan_out(slots, hello.as_ref(), takes, &mut w).await;
@@ -343,15 +362,146 @@ async fn post_take_slot(
         };
     };
     match slot.clob.post_order_bytes(&body).await {
-        Ok(_) => FleetReply::Ack {
-            email: t.email,
-            seq: t.seq,
-            ok: true,
-        },
+        Ok(v) => reply_from_post(t, v),
         Err(e) => FleetReply::Reject {
             email: t.email,
             seq: t.seq,
             reason: e,
         },
+    }
+}
+
+fn json_f64(v: Option<&serde_json::Value>) -> Option<f64> {
+    match v? {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+fn reply_from_post(t: FleetTake, v: serde_json::Value) -> FleetReply {
+    if v.get("success").and_then(|x| x.as_bool()) == Some(false) {
+        let reason = v
+            .get("errorMsg")
+            .or_else(|| v.get("error"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("rejected")
+            .to_string();
+        return FleetReply::Reject {
+            email: t.email,
+            seq: t.seq,
+            reason,
+        };
+    }
+    let size = ["takingAmount", "taking_amount", "size", "filledSize"]
+        .into_iter()
+        .find_map(|k| json_f64(v.get(k)));
+    let px = json_f64(v.get("price")).unwrap_or(t.px_ticks as f64 / 100.0);
+    let status = v
+        .get("status")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    match size {
+        Some(n) if n > 1e-9 => {
+            return FleetReply::Fill {
+                email: t.email,
+                seq: t.seq,
+                size: n,
+                px,
+            };
+        }
+        Some(_) => {}
+        None if status == "matched" => {
+            return FleetReply::Fill {
+                email: t.email,
+                seq: t.seq,
+                size: t.size,
+                px,
+            };
+        }
+        None => {}
+    }
+    if t.post_only {
+        return FleetReply::Ack {
+            email: t.email,
+            seq: t.seq,
+            ok: true,
+        };
+    }
+    FleetReply::Reject {
+        email: t.email,
+        seq: t.seq,
+        reason: "unfilled".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn take(size: f64, post_only: bool) -> FleetTake {
+        FleetTake {
+            email: "a@b.c".into(),
+            token: "yes".into(),
+            px_ticks: 51,
+            size,
+            tif: if post_only { "GTC".into() } else { "FAK".into() },
+            post_only,
+            seq: 7,
+        }
+    }
+
+    #[test]
+    fn fill_uses_taking_amount() {
+        let r = reply_from_post(
+            take(15.0, false),
+            json!({ "success": true, "takingAmount": "5.0", "price": "0.51", "status": "matched" }),
+        );
+        match r {
+            FleetReply::Fill { size, px, seq, .. } => {
+                assert!((size - 5.0).abs() < 1e-9);
+                assert!((px - 0.51).abs() < 1e-9);
+                assert_eq!(seq, 7);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_taking_amount_is_not_a_fill() {
+        let r = reply_from_post(
+            take(15.0, false),
+            json!({ "success": true, "takingAmount": 0, "status": "matched" }),
+        );
+        match r {
+            FleetReply::Reject { reason, .. } => assert_eq!(reason, "unfilled"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn post_only_resting_is_ack_not_fill() {
+        let r = reply_from_post(
+            take(15.0, true),
+            json!({ "success": true, "status": "live" }),
+        );
+        match r {
+            FleetReply::Ack { ok, .. } => assert!(ok),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn success_false_is_reject() {
+        let r = reply_from_post(
+            take(15.0, false),
+            json!({ "success": false, "errorMsg": "not enough balance" }),
+        );
+        match r {
+            FleetReply::Reject { reason, .. } => assert_eq!(reason, "not enough balance"),
+            other => panic!("{other:?}"),
+        }
     }
 }

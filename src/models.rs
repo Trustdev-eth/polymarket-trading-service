@@ -300,7 +300,7 @@ pub struct Order {
     pub created_at: Option<BsonDateTime>,
     #[serde(default, rename = "updatedAt")]
     pub updated_at: Option<BsonDateTime>,
-    #[serde(default, rename = "paidAt")]
+    #[serde(default, rename = "paidAt", skip_serializing_if = "Option::is_none")]
     pub paid_at: Option<BsonDateTime>,
 }
 

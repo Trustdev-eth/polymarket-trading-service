@@ -1,0 +1,30 @@
+[package]
+name = "mm-md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Binance USDM bookTicker, Polymarket market WS, RTDS Chainlink + 60s TWAP, Gamma."
+
+[dependencies]
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+futures-util.workspace = true
+mm-engine.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+socket2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+mm-clob.workspace = true
+
+[target.'cfg(not(windows))'.dependencies]
+reqwest = { workspace = true, features = ["rustls-tls"] }
+tokio-tungstenite.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+reqwest = { workspace = true, features = ["native-tls"] }
+ureq.workspace = true
+native-tls.workspace = true
+tungstenite.workspace = true

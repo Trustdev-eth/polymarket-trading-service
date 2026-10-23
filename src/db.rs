@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
-use mongodb::bson::{doc, DateTime as BsonDateTime};
+use mongodb::bson::{doc, Bson, DateTime as BsonDateTime};
 use mongodb::{Client, Collection, Database, IndexModel};
 use reqwest::Client as HttpClient;
 
@@ -199,13 +199,7 @@ impl App {
         let r = self
             .orders()
             .update_one(
-                doc! {
-                    "orderId": order_id,
-                    "$or": [
-                        { "paidAt": { "$exists": false } },
-                        { "paidAt": null }
-                    ]
-                },
+                unpaid_order_filter(order_id),
                 doc! { "$set": { "paidAt": now, "status": status } },
                 None,
             )
@@ -331,4 +325,40 @@ pub fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64
+}
+
+/// New invoices used to serialize `paidAt: null`. In Mongo that field *exists*,
+/// so `$exists: false` never granted. Match missing *or* null.
+fn unpaid_order_filter(order_id: &str) -> mongodb::bson::Document {
+    doc! {
+        "orderId": order_id,
+        "$or": [
+            { "paidAt": { "$exists": false } },
+            { "paidAt": Bson::Null },
+        ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unpaid_filter_matches_missing_or_null_paid_at() {
+        let d = unpaid_order_filter("ord-1");
+        assert_eq!(d.get_str("orderId").unwrap(), "ord-1");
+        let or = d.get_array("$or").unwrap();
+        assert_eq!(or.len(), 2);
+        let missing = or[0].as_document().unwrap();
+        assert_eq!(
+            missing
+                .get_document("paidAt")
+                .unwrap()
+                .get_bool("$exists")
+                .unwrap(),
+            false
+        );
+        let nulls = or[1].as_document().unwrap();
+        assert!(matches!(nulls.get("paidAt"), Some(Bson::Null)));
+    }
 }
