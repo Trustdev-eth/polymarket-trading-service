@@ -193,10 +193,19 @@ impl App {
         self.orders()
             .update_one(doc! { "orderId": order_id }, doc! { "$set": set }, None)
             .await?;
+        if !crate::nowpayments::unlocks(status) {
+            return Ok(false);
+        }
         let r = self
             .orders()
             .update_one(
-                doc! { "orderId": order_id, "paidAt": { "$exists": false } },
+                doc! {
+                    "orderId": order_id,
+                    "$or": [
+                        { "paidAt": { "$exists": false } },
+                        { "paidAt": null }
+                    ]
+                },
                 doc! { "$set": { "paidAt": now, "status": status } },
                 None,
             )
