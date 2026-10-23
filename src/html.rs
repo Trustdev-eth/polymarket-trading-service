@@ -93,7 +93,7 @@ fn shell(title: &str, nav: &str, body: &str, extra: &str, footer: &str) -> Html<
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
 {boot}
-<link rel="stylesheet" href="/app.css?v=hdr2">
+<link rel="stylesheet" href="/app.css?v=hdr3">
 <link rel="icon" href="/ohioismquant-logo.png" type="image/png">
 </head>
 <body>
@@ -213,7 +213,7 @@ fn dash_shell_ex(title: &str, nav: &str, body: &str, scripts: &str, charts: bool
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
 {boot}
-<link rel="stylesheet" href="/app.css?v=hdr2">
+<link rel="stylesheet" href="/app.css?v=hdr3">
 <link rel="stylesheet" href="/dash.css?v=hdr1">
 <link rel="icon" href="/ohioismquant-logo.png" type="image/png">
 {chart}
