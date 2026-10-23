@@ -40,7 +40,7 @@ body{margin:0;background:var(--bg);color:var(--fg);font:400 16px/1.65 var(--body
 a{color:inherit;text-decoration:none}h1,h2,h3,p{margin:0}h1,h2,h3{font-family:var(--display);font-weight:600;letter-spacing:-.04em}
 button,input,select,textarea{font:inherit}button{cursor:pointer}
 .wrap{width:min(1120px,calc(100% - 48px));margin-inline:auto}
-.site-header{position:sticky;top:0;z-index:20;border-bottom:1px solid var(--line);background:color-mix(in srgb,var(--header) 92%,transparent);backdrop-filter:blur(12px)}
+.site-header{position:sticky;top:0;z-index:20;border-bottom:1px solid var(--line);background:color-mix(in srgb,var(--header) 96%,transparent);backdrop-filter:blur(12px)}
 .header-inner{width:min(1280px,calc(100% - 32px));margin-inline:auto;min-height:64px;display:flex;align-items:center;gap:16px;flex-wrap:nowrap}
 .brand{display:flex;align-items:center;gap:10px;font-family:var(--display);font-weight:700;font-size:1.15rem;letter-spacing:-.03em;flex-shrink:0;line-height:1}
 .brand-logo{display:block;width:40px;height:40px;flex-shrink:0;object-fit:contain;background:transparent;border:0;border-radius:0}
@@ -54,8 +54,9 @@ button,input,select,textarea{font:inherit}button{cursor:pointer}
 .head-grow{flex:1;min-width:12px}
 .nav-end{gap:8px;flex-shrink:0;margin-left:8px}
 .nav-end .btn{min-height:40px;padding:8px 16px}
-.head-logout{border:0;background:transparent;color:var(--muted);min-height:40px;padding:0 10px;border-radius:8px;font-weight:600;font-size:.88rem}
-.head-logout:hover{color:var(--fg);background:var(--tint)}
+.head-logout,.head-signin{border:0;background:transparent;color:var(--muted);min-height:40px;padding:0 10px;border-radius:8px;font-weight:600;font-size:.88rem}
+.head-logout:hover,.head-signin:hover{color:var(--fg);background:var(--tint)}
+#model,#size,#pricing{scroll-margin-top:76px}
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:46px;padding:10px 20px;border-radius:7px;border:1px solid var(--green);background:var(--green);color:var(--on-green);font-weight:600;transition:transform .15s,box-shadow .15s}
 .btn:hover{transform:translateY(-1px);box-shadow:var(--btn-glow)}
 .btn:disabled{opacity:.45;cursor:not-allowed;transform:none;box-shadow:none}
@@ -225,4 +226,5 @@ th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line)}
 @media(max-width:720px){
   .header-inner{flex-wrap:wrap;row-gap:8px}
   .lang-toggle button{min-height:36px;padding:0 10px}
+  .head-signin{display:none}
 }

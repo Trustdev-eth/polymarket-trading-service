@@ -20,8 +20,8 @@ fn theme_toggle() -> &'static str {
 }
 
 fn chrome_js() -> &'static str {
-    r#"<script src="/i18n.js?v=i18n5"></script>
-<script src="/theme.js?v=i18n5"></script>"#
+    r#"<script src="/i18n.js?v=i18n6"></script>
+<script src="/theme.js?v=i18n6"></script>"#
 }
 
 fn brand_mark(admin_site: bool) -> &'static str {
@@ -38,12 +38,17 @@ fn nav(
     admin_href: &str,
     admin_site: bool,
     app_url: &str,
+    page: &str,
 ) -> String {
     let brand = brand_mark(admin_site);
-    let pages = if admin_site {
-        format!(
-            r#"<a href="{app}" data-i18n="nav.tradesite">Trade site</a>"#,
-            app = app_url
+    let (pages, ticker, actions) = if admin_site {
+        (
+            format!(
+                r#"<a href="{app}" data-i18n="nav.tradesite">Trade site</a>"#,
+                app = app_url
+            ),
+            String::new(),
+            String::new(),
         )
     } else if email.is_some() {
         let admin_link = if admin {
@@ -54,15 +59,28 @@ fn nav(
         } else {
             String::new()
         };
-        format!(
-            r#"<a href="/dash" data-i18n="nav.dash">Dashboard</a>
+        (
+            format!(
+                r#"<a href="/dash" data-i18n="nav.dash">Dashboard</a>
                <a href="/pnl" data-i18n="nav.pnl">PnL</a>
                <a href="/desk" data-i18n="nav.desk">Desk</a>
                {admin_link}"#
+            ),
+            String::new(),
+            String::new(),
+        )
+    } else if page == "home" {
+        (
+            r##"<a href="#model" data-i18n="nav.model">Strategy</a>
+               <a href="#size" data-i18n="nav.size">Size</a>
+               <a href="#pricing" data-i18n="nav.pricing">Pricing</a>"##
+                .into(),
+            r#"<div class="head-ticker"><span class="head-chip">BTC 15m</span></div>"#.into(),
+            r#"<a class="head-signin" href="/login" data-i18n="nav.signin">Sign in</a><a class="btn" href="/login?plan=test" data-i18n="nav.start">Start $50 test</a>"#
+                .into(),
         )
     } else {
-        r#"<a href="/login" data-i18n="nav.signin">Sign in</a><a class="btn" href="/login?plan=test" data-i18n="nav.start">Start $50 test</a>"#
-            .into()
+        (String::new(), String::new(), String::new())
     };
     let logout = if email.is_some() {
         r#"<button class="head-logout" type="button" id="logout" data-i18n="nav.logout">Log out</button>"#
@@ -74,10 +92,13 @@ fn nav(
         {brand}
         <nav class="nav head-pages">{pages}</nav>
         <div class="head-grow"></div>
-        <nav class="nav nav-end">{lang}{toggle}{logout}</nav>
+        {ticker}
+        <nav class="nav nav-end">{lang}{toggle}{actions}{logout}</nav>
         </div></header>"#,
         brand = brand,
         pages = pages,
+        ticker = ticker,
+        actions = actions,
         logout = logout,
         lang = lang_toggle(),
         toggle = theme_toggle()
@@ -93,7 +114,7 @@ fn shell(title: &str, nav: &str, body: &str, extra: &str, footer: &str) -> Html<
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
 {boot}
-<link rel="stylesheet" href="/app.css?v=hdr3">
+<link rel="stylesheet" href="/app.css?v=hdr4">
 <link rel="icon" href="/ohioismquant-logo.png" type="image/png">
 </head>
 <body>
@@ -213,7 +234,7 @@ fn dash_shell_ex(title: &str, nav: &str, body: &str, scripts: &str, charts: bool
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
 {boot}
-<link rel="stylesheet" href="/app.css?v=hdr3">
+<link rel="stylesheet" href="/app.css?v=hdr4">
 <link rel="stylesheet" href="/dash.css?v=hdr1">
 <link rel="icon" href="/ohioismquant-logo.png" type="image/png">
 {chart}
@@ -277,7 +298,7 @@ pub fn landing(email: Option<&str>, admin: bool, admin_href: &str) -> Html<Strin
     <div><b>$1,500/mo</b><span data-i18n="land.stripFeed">PAID PRICE FEED</span></div>
     <div><b>UK + TKY</b><span data-i18n="land.stripRail">BRAIN / WIRE</span></div>
   </div>
-  <section class="wrap wrap-wide model">
+  <section class="wrap wrap-wide model" id="model">
     <p class="eyebrow" data-i18n="land.modelEye">The strategy</p>
     <h2 data-i18n="land.modelH">How a window is actually traded</h2>
     <p class="model-lead" data-i18n="land.modelP">Polymarket lists a BTC up/down contract every 15 minutes. A professional low-latency feed prices that window. If the live market is still off that price, we trade. If not, we wait. That is the whole system.</p>
@@ -299,7 +320,7 @@ pub fn landing(email: Option<&str>, admin: bool, admin_href: &str) -> Html<Strin
       </article>
     </div>
   </section>
-  <section class="wrap wrap-wide size-sec">
+  <section class="wrap wrap-wide size-sec" id="size">
     <div class="size-head">
       <div>
         <p class="eyebrow" data-i18n="land.sizeEye">Size and money</p>
@@ -362,7 +383,7 @@ pub fn landing(email: Option<&str>, admin: bool, admin_href: &str) -> Html<Strin
     </div>
     <p class="note" data-i18n="land.mktNote">Only BTC 15-minute up/down is live. We do not list products we are not running.</p>
   </section>
-  <section class="wrap wrap-wide">
+  <section class="wrap wrap-wide" id="pricing">
     <div class="price-grid">
       <article class="price-card">
         <span class="eyebrow" data-i18n="land.testEye">Test</span>
@@ -411,7 +432,7 @@ pub fn landing(email: Option<&str>, admin: bool, admin_href: &str) -> Html<Strin
 </main>"#;
     shell(
         "OhioismQuant Trade",
-        &nav(email, admin, admin_href, false, ""),
+        &nav(email, admin, admin_href, false, "", "home"),
         body,
         r#"<script>const q=new URLSearchParams(location.search).get('ref');if(q)localStorage.setItem('trade_ref',q);</script>"#,
         trade_footer(),
@@ -453,7 +474,7 @@ up.onclick=()=>send('/api/auth/signup');
 </script>"#;
     shell(
         "Sign in · Trade",
-        &nav(None, false, "/admin", false, ""),
+        &nav(None, false, "/admin", false, "", "login"),
         body,
         "",
         trade_footer(),
@@ -487,7 +508,7 @@ f.addEventListener('submit', async e => {
 </script>"#;
     shell(
         "Sign in · Admin",
-        &nav(None, true, "/", true, app_url),
+        &nav(None, true, "/", true, app_url, "login"),
         body,
         "",
         admin_footer(),
@@ -719,7 +740,7 @@ pub fn admin(email: &str, app_url: &str) -> Html<String> {
 <script src="/admin.js?v=i18n1"></script>"#;
     shell(
         "Admin · Trade Card",
-        &nav(Some(email), true, "/", true, app_url),
+        &nav(Some(email), true, "/", true, app_url, "admin"),
         body,
         "",
         admin_footer(),
