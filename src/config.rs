@@ -184,7 +184,7 @@ pub const MONTH_DAYS: i64 = 30;
 /// Polymarket CLOB minimum. Also the house default.
 pub const MIN_BASE: f64 = 5.0;
 pub const HOUSE_BASE: f64 = 5.0;
-pub const HOUSE_NET: f64 = 15.0;
+pub const HOUSE_NET: f64 = 0.0;
 /// Test stays on the CLOB minimum. Month may size up from house best.
 pub const TEST_BASE: f64 = 5.0;
 pub const TEST_NET: f64 = 15.0;

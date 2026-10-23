@@ -253,7 +253,7 @@ pub async fn signup(
         halted: !admin,
         live: false,
         paper: admin,
-        hedge: true,
+        hedge: false,
         base_amount: HOUSE_BASE,
         max_net: HOUSE_NET,
         paper_cash_usd: Some(PAPER_CASH),
@@ -263,6 +263,9 @@ pub async fn signup(
         trade_paid_usd: 0.0,
         keys: None,
         created_at: Some(BsonDateTime::from_millis(now_ms())),
+        session_started_at: None,
+        session_mode: String::new(),
+        session_start_balance: None,
     };
     app.insert_member(&member).await?;
     let token = sign_session(&app.cfg, &email, admin)?;
@@ -641,12 +644,30 @@ async fn apply_run(
         gate_live_start(app, member).await?;
     }
     let flags = next_run(mode, running).map_err(|e| AppError::BadRequest(e.into()))?;
+    let mut set = run_set_doc(flags);
+    if running {
+        set.insert(
+            "sessionStartedAt",
+            BsonDateTime::from_millis(now_ms()),
+        );
+        set.insert("sessionMode", if mode == "live" { "live" } else { "paper" });
+        if mode == "live" {
+            if let Some(funder) = member
+                .keys
+                .as_ref()
+                .map(|k| k.funder.clone())
+                .filter(|s| !s.is_empty())
+            {
+                if let Ok(book) = crate::poly::funder_book(&app.http, &funder).await {
+                    set.insert("sessionStartBalance", book.balance);
+                }
+            }
+        } else {
+            set.insert("sessionStartBalance", mongodb::bson::Bson::Null);
+        }
+    }
     app.members()
-        .update_one(
-            doc! { "email": &member.email },
-            doc! { "$set": run_set_doc(flags) },
-            None,
-        )
+        .update_one(doc! { "email": &member.email }, doc! { "$set": set }, None)
         .await?;
     app.require_member_email(&member.email).await
 }
@@ -926,10 +947,8 @@ pub async fn api_last(State(app): State<App>, headers: HeaderMap) -> AppResult<J
         Ok(None) => snap_tick(&app.house_snap().await.unwrap_or_default()),
         Err(_) => serde_json::json!({}),
     };
-    if crate::quotes::tick_needs_overlay(&tick, now_ms()) {
-        if let Ok(o) = crate::quotes::cached_overlay(&app.http, "btc", 15, "btcusdt").await {
-            crate::quotes::merge_tick(&mut tick, &o);
-        }
+    if let Ok(o) = crate::quotes::cached_overlay(&app.http, "btc", 15, "btcusdt").await {
+        crate::quotes::merge_tick(&mut tick, &o);
     }
     let fills = app.recent_fills(&member.email, 12).await.unwrap_or_default();
     Ok(Json(json!({
@@ -940,18 +959,52 @@ pub async fn api_last(State(app): State<App>, headers: HeaderMap) -> AppResult<J
     })))
 }
 
+fn signer_on_file(member: &crate::models::Member) -> bool {
+    member.keys.as_ref().is_some_and(|k| !k.key_enc.is_empty())
+}
+
+/// Live PnL only when the coordinator actually posts live. Live-without-signer is paper.
+fn pnl_session_mode(member: &crate::models::Member) -> String {
+    let flags = member.run_flags();
+    let live_ok = signer_on_file(member);
+    if flags.live_running() && live_ok {
+        "live".into()
+    } else if flags.paper_running() || flags.live_running() {
+        "paper".into()
+    } else if member.session_mode == "live" && live_ok {
+        "live".into()
+    } else if member.session_mode == "live" || member.session_mode == "paper" {
+        member.session_mode.clone()
+    } else {
+        "paper".into()
+    }
+}
+
+async fn session_bounds(_app: &crate::db::App, member: &crate::models::Member) -> (String, i64) {
+    (pnl_session_mode(member), member.session_started_ms())
+}
+
 pub async fn api_pnl(State(app): State<App>, headers: HeaderMap) -> AppResult<Json<Value>> {
     let member = load_session(&app, &headers).await?;
     require_vip(&member)?;
-    let results = app.recent_results(&member.email, 400).await.unwrap_or_default();
-    let fills = app.recent_fills(&member.email, 80).await.unwrap_or_default();
+    let (session_mode, session_start) = session_bounds(&app, &member).await;
+    let all = app.recent_results(&member.email, 800).await.unwrap_or_default();
+    let results: Vec<_> = all
+        .into_iter()
+        .filter(|r| r.ts_ms >= session_start)
+        .filter(|r| if session_mode == "live" { !r.paper } else { r.paper })
+        .collect();
+    let snap = app.snap_for(&member.email).await.unwrap_or_default();
     let mut days: serde_json::Map<String, Value> = serde_json::Map::new();
     let mut equity = Vec::new();
-    let mut cash = PAPER_CASH;
+    let mut realized = 0.0;
     let mut chron: Vec<_> = results.iter().collect();
     chron.sort_by_key(|r| r.ts_ms);
+    if session_start > 0 {
+        equity.push(json!({ "ts": session_start, "pnl": 0.0, "cum": 0.0, "slug": "" }));
+    }
     for r in &chron {
-        cash += r.pnl;
+        realized += r.pnl;
         let day = chrono::DateTime::from_timestamp_millis(r.ts_ms)
             .map(|t| t.format("%Y-%m-%d").to_string())
             .unwrap_or_else(|| "unknown".into());
@@ -962,10 +1015,41 @@ pub async fn api_pnl(State(app): State<App>, headers: HeaderMap) -> AppResult<Js
             obj.insert("pnl".into(), json!(round2(pnl)));
             obj.insert("n".into(), json!(n));
         }
-        equity.push(json!({ "ts": r.ts_ms, "pnl": round2(r.pnl), "cash": round2(cash), "slug": r.slug }));
+        equity.push(json!({
+            "ts": r.ts_ms,
+            "pnl": round2(r.pnl),
+            "cum": round2(realized),
+            "slug": r.slug,
+        }));
     }
+    let mark = snap.mark_pnl;
+    let total = realized + mark;
+    let flags = member.run_flags();
+    if flags.paper_running() || flags.live_running() {
+        equity.push(json!({
+            "ts": now_ms(),
+            "pnl": round2(mark),
+            "cum": round2(total),
+            "slug": snap.slug,
+            "mark": true,
+        }));
+    }
+    let fills = if session_mode == "live" {
+        app.recent_fills(&member.email, 80)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|f| f.ts_ms >= session_start && !f.paper)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     Ok(Json(json!({
-        "paperCashUsd": round2(member.paper_cash()),
+        "mode": session_mode,
+        "sessionStartedAt": session_start,
+        "realizedPnl": round2(realized),
+        "markPnl": round2(mark),
+        "pnl": round2(total),
         "results": results,
         "fills": fills,
         "days": days,
@@ -978,29 +1062,54 @@ pub async fn api_balance(State(app): State<App>, headers: HeaderMap) -> AppResul
     require_vip(&member)?;
     let snap = app.snap_for(&member.email).await.unwrap_or_default();
     let mark = snap.mark_pnl;
-    if member.live && member.keys_connected() {
+    let (session_mode, session_start) = session_bounds(&app, &member).await;
+    let realized = app
+        .recent_results(&member.email, 800)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.ts_ms >= session_start)
+        .filter(|r| if session_mode == "live" { !r.paper } else { r.paper })
+        .map(|r| r.pnl)
+        .sum::<f64>();
+    let pnl = round2(realized + mark);
+    let need = capital::fund_for_base(member.base_amount.max(MIN_BASE));
+    if session_mode == "live" && member.keys_connected() {
         let funder = member.keys.as_ref().map(|k| k.funder.clone()).unwrap_or_default();
-        match crate::poly::funder_value(&app.http, &funder).await {
-            Ok(have) => {
+        match crate::poly::funder_book(&app.http, &funder).await {
+            Ok(book) => {
+                let start_bal = member.session_start_balance.unwrap_or(0.0);
+                let wallet_pnl = if start_bal > 0.0 {
+                    Some(round2(book.balance - start_bal))
+                } else {
+                    None
+                };
                 return Ok(Json(json!({
                     "paper": false,
-                    "cash": round2(have),
-                    "portfolio": round2(have + mark),
+                    "mode": "live",
+                    "cash": round2(book.cash),
+                    "balance": round2(book.balance),
+                    "portfolio": round2(book.balance),
+                    "pnl": pnl,
+                    "realizedPnl": round2(realized),
                     "markPnl": round2(mark),
-                    "need": capital::fund_for_base(member.base_amount.max(MIN_BASE)),
+                    "walletPnl": wallet_pnl,
+                    "need": need,
                 })));
             }
-            Err(e) => tracing::warn!(error = %e, "funder value"),
+            Err(e) => tracing::warn!(error = %e, "funder book"),
         }
     }
-    let cash = member.paper_cash() + mark;
     Ok(Json(json!({
         "paper": true,
-        "cash": round2(cash),
-        "portfolio": round2(cash),
-        "paperCashUsd": round2(member.paper_cash()),
+        "mode": "paper",
+        "cash": None::<f64>,
+        "balance": None::<f64>,
+        "portfolio": None::<f64>,
+        "pnl": pnl,
+        "realizedPnl": round2(realized),
         "markPnl": round2(mark),
-        "need": capital::fund_for_base(member.base_amount.max(MIN_BASE)),
+        "need": need,
     })))
 }
 
@@ -1179,6 +1288,7 @@ pub async fn admin_gift(
                 "halted": false,
                 "baseAmount": HOUSE_BASE,
                 "maxNet": HOUSE_NET,
+                "hedge": false,
                 "paperCashUsd": PAPER_CASH,
             }},
             None,

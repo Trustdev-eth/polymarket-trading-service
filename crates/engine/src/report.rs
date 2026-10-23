@@ -191,7 +191,7 @@ impl Engine {
             regime: if tau > self.cfg.twap_window_s { "spot" } else { "twap_lock" },
             quote: self.quote_block(now_ms),
             s_hat: s.s_hat,
-            binance_mid: s.fast_mid,
+            binance_mid: s.binance_mid,
             chainlink: s.chainlink,
             twap: s.twap,
             fair: self.fair(now_ms),

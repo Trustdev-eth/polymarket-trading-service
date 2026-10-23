@@ -1,19 +1,19 @@
 const $ = (id) => document.getElementById(id);
 const tr = (k, vars) => (window.OQ_I18N && OQ_I18N.t ? OQ_I18N.t(k, vars) : k);
 const page = location.pathname.startsWith("/pnl") ? "pnl" : "dash";
-const MAX = 420;
 const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const DOW = ["S","M","T","W","T","F","S"];
 const fmt = (n, d = 2) => (n == null || !isFinite(Number(n)) ? "—" : Number(n).toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d }));
 const moneyWhole = (n) =>
   n == null || !isFinite(Number(n)) ? "—" : "$" + Math.round(Number(n)).toLocaleString("en-US");
+const moneyPnl = (n) => {
+  if (n == null || !isFinite(Number(n))) return "—";
+  const v = Number(n);
+  const abs = Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return (v > 0 ? "+" : v < 0 ? "−" : "") + "$" + abs;
+};
 const tlabel = (ts) => new Date(ts).toISOString().slice(11, 19);
 const nz = (x) => { const n = Number(x); return isFinite(n) && n > 0 ? n : null; };
-const copied = (a, b) => {
-  const x = nz(a), y = nz(b);
-  return x != null && y != null && Math.abs(x - y) < 1e-6;
-};
-const chainlinkPx = (t) => (copied(t.chainlink, t.binance) ? null : nz(t.chainlink));
-const twapPx = (t) => (copied(t.twap, t.k_t) || copied(t.twap, t.binance) ? null : nz(t.twap));
 const bookPx = (a, b) => (isFinite(a) && isFinite(b) && (a > 0 || b > 0) ? `${fmt(a, 3)} / ${fmt(b, 3)}` : "—");
 
 function notify(title, body) {
@@ -58,6 +58,8 @@ function setMode(me) {
   document.querySelectorAll(".head-acct").forEach((n) => {
     n.hidden = m === "FREE";
   });
+  const fills = $("fillSection");
+  if (fills) fills.hidden = m !== "LIVE";
 }
 
 function setRunBanner(me) {
@@ -77,11 +79,30 @@ function setRunBanner(me) {
   }
 }
 
+function paintPnlEl(el, n) {
+  if (!el) return;
+  el.textContent = moneyPnl(n);
+  el.classList.toggle("pos", Number(n) > 0);
+  el.classList.toggle("neg", Number(n) < 0);
+}
+
 async function loadBalance() {
   try {
     const b = await api("/api/balance");
-    if ($("acctCash")) $("acctCash").textContent = moneyWhole(b.cash);
-    if ($("acctPort")) $("acctPort").textContent = moneyWhole(b.portfolio);
+    const live = b.mode === "live" && !b.paper;
+    const wrap = $("acctBalWrap");
+    if (wrap) wrap.hidden = !live;
+    if (live) {
+      if ($("acctCash")) $("acctCash").textContent = moneyWhole(b.balance != null ? b.balance : b.cash);
+    }
+    paintPnlEl($("acctPnl"), b.pnl);
+    if ($("deskPnl")) paintPnlEl($("deskPnl"), b.pnl);
+    if ($("pnlSession")) paintPnlEl($("pnlSession"), b.pnl);
+    const pnlBal = $("pnlBalWrap");
+    if (pnlBal) {
+      pnlBal.hidden = !live;
+      if (live && $("pnlBal")) $("pnlBal").textContent = moneyWhole(b.balance != null ? b.balance : b.cash);
+    }
   } catch (_) {}
 }
 
@@ -96,19 +117,20 @@ document.querySelectorAll(".head-pages a").forEach((a) => {
   a.classList.toggle("on", a.getAttribute("href") === "/" + page || (page === "dash" && a.getAttribute("href") === "/dash"));
 });
 
-const WINDOW_MS = 8 * 60 * 1000;
+let WINDOW_MS = 8 * 60 * 1000;
 const BUCKET_MS = 400;
 const DRAW_MS = 50;
-const EASE_MS = 280;
+const EASE_MS = 220;
 const POLL_MS = 400;
-const LTTB_N = 160;
+const LTTB_N = 220;
 const SERIES_KEYS = ["binance", "chainlink", "twap", "yes_bid", "yes_ask", "no_bid", "no_ask", "s_hat"];
 
-let btc, yn, sig, chartsReady = false, current = "", drawRaf = 0, lastDraw = 0;
+let btc, yn, sig, eqChart, chartsReady = false, current = "", drawRaf = 0, lastDraw = 0;
 let buf = [];
 let want = null;
 let view = null;
 let lastStatKey = "";
+let userZoomed = false;
 
 function isLight() {
   return document.documentElement.getAttribute("data-theme") === "light";
@@ -123,19 +145,19 @@ function chartTheme() {
       body: "#17241e",
       legend: "#63716b",
       title: "#63716b",
-      empty: "#eaf4ed",
+      empty: "#ebedf0",
       month: "#63716b",
     };
   }
   return {
     tick: "#8aa196",
-    grid: "rgba(255,255,255,0.05)",
+    grid: "rgba(255,255,255,0.06)",
     tooltipBg: "#101816",
     border: "#24332c",
     body: "#f4faf6",
     legend: "#9aada3",
     title: "#9aada3",
-    empty: "#1b2621",
+    empty: "#161b22",
     month: "#8aa196",
   };
 }
@@ -152,12 +174,12 @@ function chartCommon() {
     spanGaps: true,
     responsive: true,
     maintainAspectRatio: false,
-    interaction: { mode: "nearest", axis: "x", intersect: false },
-    elements: { point: { radius: 0, hoverRadius: 3 } },
+    interaction: { mode: "index", axis: "x", intersect: false },
+    elements: { point: { radius: 0, hoverRadius: 4 }, line: { tension: 0.25 } },
     plugins: {
       decimation: { enabled: false },
       legend: {
-        labels: { color: th.legend, boxWidth: 8, boxHeight: 8, usePointStyle: true, pointStyle: "line", font: { size: 11 } },
+        labels: { color: th.legend, boxWidth: 10, boxHeight: 2, usePointStyle: true, pointStyle: "line", font: { size: 11 }, padding: 12 },
       },
       tooltip: {
         backgroundColor: th.tooltipBg,
@@ -170,6 +192,16 @@ function chartCommon() {
           title: (items) => (items[0] ? tlabel(items[0].parsed.x) : ""),
           label: (item) => `${item.dataset.label}: ${fmt(item.parsed.y, item.parsed.y < 2 ? 3 : 2)}`,
         },
+      },
+      zoom: {
+        pan: { enabled: true, mode: "x", modifierKey: undefined, onPanStart: () => { userZoomed = true; } },
+        zoom: {
+          wheel: { enabled: true },
+          pinch: { enabled: true },
+          mode: "x",
+          onZoomStart: () => { userZoomed = true; },
+        },
+        limits: { x: { minRange: 20_000 } },
       },
     },
     scales: {
@@ -217,12 +249,15 @@ function dsLine(label, color, extra = {}) {
     label,
     data: [],
     borderColor: color,
-    borderWidth: 1.75,
+    backgroundColor: extra.fill ? color + "22" : "transparent",
+    borderWidth: extra.borderWidth || 2,
     pointRadius: 0,
-    cubicInterpolationMode: "monotone",
+    tension: 0.08,
+    cubicInterpolationMode: "default",
     borderJoinStyle: "round",
     borderCapStyle: "round",
     spanGaps: true,
+    fill: extra.fill || false,
     ...extra,
   };
 }
@@ -230,19 +265,19 @@ function dsLine(label, color, extra = {}) {
 function ensureCharts() {
   if (chartsReady || page !== "dash" || typeof Chart === "undefined") return;
   try {
-  btc = line("cBtc", [
-    dsLine("Binance", "#f5c451"),
-    dsLine("Chainlink", "#93c5fd"),
-    dsLine("TWAP", "#6ee7b7"),
-  ]);
-  const common = chartCommon();
-  yn = line("cYn", [
-    dsLine("Yes bid", "#34d399"),
-    dsLine("Yes ask", "#6ee7b7", { borderDash: [4, 3], borderWidth: 1 }),
-    dsLine("No bid", "#fb7185"),
-    dsLine("No ask", "#fda4af", { borderDash: [4, 3], borderWidth: 1 }),
-  ], { scales: { ...common.scales, y: { ...common.scales.y, min: -0.02, max: 1.02 } } });
-  sig = line("cSig", [dsLine("Ŝ", "#e879f9")]);
+    btc = line("cBtc", [
+      dsLine("Binance", "#f5c451"),
+      dsLine("Chainlink", "#7dd3fc"),
+      dsLine("TWAP", "#6ee7b7", { borderDash: [5, 4], borderWidth: 1.5 }),
+    ]);
+    const common = chartCommon();
+    yn = line("cYn", [
+      dsLine("Yes bid", "#34d399"),
+      dsLine("Yes ask", "#6ee7b7", { borderDash: [4, 3], borderWidth: 1.25 }),
+      dsLine("No bid", "#fb7185"),
+      dsLine("No ask", "#fda4af", { borderDash: [4, 3], borderWidth: 1.25 }),
+    ], { scales: { ...common.scales, y: { ...common.scales.y, min: 0, max: 1 } } });
+    sig = line("cSig", [dsLine("Ŝ", "#e879f9")]);
     chartsReady = true;
   } catch (_) {}
 }
@@ -302,7 +337,7 @@ function seriesXY(key) {
   return reduced;
 }
 
-function fitY(chart, padFrac, minPad) {
+function fitY(chart, padFrac, minPad, hard) {
   if (!chart) return;
   const ys = [];
   for (const ds of chart.data.datasets) {
@@ -313,41 +348,37 @@ function fitY(chart, padFrac, minPad) {
   if (!ys.length) return;
   let lo = Math.min.apply(null, ys);
   let hi = Math.max.apply(null, ys);
-  const pad = Math.max((hi - lo) * padFrac, minPad);
+  if (hi - lo < minPad) {
+    const mid = (hi + lo) / 2;
+    lo = mid - minPad / 2;
+    hi = mid + minPad / 2;
+  }
+  const pad = Math.max((hi - lo) * padFrac, minPad * 0.15);
   lo -= pad;
   hi += pad;
   const y = chart.options.scales.y;
-  if (y.min == null || y.max == null) {
+  if (hard || y.min == null || y.max == null) {
     y.min = lo;
     y.max = hi;
     return;
   }
-  if (lo < y.min) y.min = lo;
-  if (hi > y.max) y.max = hi;
-  const span = y.max - y.min;
-  const need = hi - lo;
-  if (need > 0 && span > need * 2.4) {
-    y.min += (lo - y.min) * 0.06;
-    y.max += (hi - y.max) * 0.06;
-  }
+  y.min += (lo - y.min) * 0.35;
+  y.max += (hi - y.max) * 0.35;
 }
 
 function trimBuf() {
-  const floor = (view && view.ts ? view.ts : Date.now()) - WINDOW_MS;
+  const floor = (view && view.ts ? view.ts : Date.now()) - Math.max(WINDOW_MS, 15 * 60 * 1000);
   while (buf.length && buf[0].ts < floor) buf.shift();
-  while (buf.length > 900) buf.shift();
+  while (buf.length > 1400) buf.shift();
 }
 
 function sampleTick(t) {
   const ts = Number(t.ts) || Date.now();
-  const prev = want || buf[buf.length - 1];
-  const cl = chainlinkPx(t);
-  const tw = twapPx(t);
   return {
     ts,
     binance: nz(t.binance),
-    chainlink: cl != null ? cl : prev && prev.chainlink,
-    twap: tw != null ? tw : prev && prev.twap,
+    chainlink: nz(t.chainlink),
+    twap: nz(t.twap),
     yes_bid: nz(t.yes_bid),
     yes_ask: nz(t.yes_ask),
     no_bid: nz(t.no_bid),
@@ -360,12 +391,8 @@ function ingest(t, history) {
   if (!t) return;
   if (t.slug && current && t.slug !== current) {
     current = t.slug;
-    if (want) {
-      want.yes_bid = want.yes_ask = want.no_bid = want.no_ask = null;
-    }
-    if (view) {
-      view.yes_bid = view.yes_ask = view.no_bid = view.no_ask = null;
-    }
+    if (want) want.yes_bid = want.yes_ask = want.no_bid = want.no_ask = null;
+    if (view) view.yes_bid = view.yes_ask = view.no_bid = view.no_ask = null;
   } else if (t.slug) {
     current = t.slug;
   }
@@ -391,25 +418,23 @@ function xWindow() {
   const now = Math.max(Date.now(), view && view.ts || 0, want && want.ts || 0);
   const first = buf.length ? buf[0].ts : now;
   const age = Math.max(0, now - first);
-  const span = Math.min(WINDOW_MS, Math.max(age * 1.08 + 2500, 12_000));
-  return { now, min: now - span, max: now + Math.max(900, span * 0.03) };
+  const span = Math.min(WINDOW_MS, Math.max(age * 1.04 + 2000, 8_000));
+  return { now, min: now - span, max: now + Math.max(600, span * 0.02) };
 }
 
 function paint() {
   if (!chartsReady || (!view && !buf.length)) return;
   const win = xWindow();
-  const xmin = win.min;
-  const xmax = win.max;
   const applyX = (c) => {
-    if (!c) return;
-    c.options.scales.x.min = xmin;
-    c.options.scales.x.max = xmax;
+    if (!c || userZoomed) return;
+    c.options.scales.x.min = win.min;
+    c.options.scales.x.max = win.max;
   };
   if (btc) {
     btc.data.datasets[0].data = seriesXY("binance");
     btc.data.datasets[1].data = seriesXY("chainlink");
     btc.data.datasets[2].data = seriesXY("twap");
-    fitY(btc, 0.16, 10);
+    fitY(btc, 0.12, 8);
     applyX(btc);
     btc.update("none");
   }
@@ -423,7 +448,7 @@ function paint() {
   }
   if (sig) {
     sig.data.datasets[0].data = seriesXY("s_hat");
-    fitY(sig, 0.16, 10);
+    fitY(sig, 0.12, 8);
     applyX(sig);
     sig.update("none");
   }
@@ -439,7 +464,8 @@ function startDrawLoop() {
     if (want && view) {
       const k = 1 - Math.exp(-dt / EASE_MS);
       for (const key of SERIES_KEYS) view[key] = ease(view[key], want[key], k);
-      view.ts = Math.max(view.ts || 0, Date.now());
+      // Last print time, not wall clock — stretching y to Date.now() drew fake Chainlink flats.
+      view.ts = Math.max(view.ts || 0, want.ts || 0);
     }
     paint();
   };
@@ -478,14 +504,15 @@ function resetCharts() {
   want = null;
   view = null;
   lastStatKey = "";
+  userZoomed = false;
   if (!chartsReady) return;
   [btc, yn, sig].forEach((c) => {
     if (!c) return;
     c.data.datasets.forEach((d) => { d.data = []; });
     if (!c.options.scales.y) return;
     if (c === yn) {
-      c.options.scales.y.min = -0.02;
-      c.options.scales.y.max = 1.02;
+      c.options.scales.y.min = 0;
+      c.options.scales.y.max = 1;
     } else {
       delete c.options.scales.y.min;
       delete c.options.scales.y.max;
@@ -498,7 +525,7 @@ function pushTick(t) {
 }
 
 function hasPx(t) {
-  return nz(t.binance) || nz(t.yes_bid) || nz(t.s_hat);
+  return nz(t.binance) || nz(t.chainlink) || nz(t.yes_bid) || nz(t.s_hat);
 }
 
 function bucketTicks(ticks) {
@@ -550,43 +577,71 @@ async function pollLast() {
       t.alloc = d.snap.alloc;
     }
     pushTick(t);
-    if (page === "dash") renderFills(d.fills || []);
+    if (page === "dash" && modeLabel(d.member || lastMe) === "LIVE") renderFills(d.fills || []);
   } catch (_) {}
 }
 
-function heatColor(pnl) {
-  if (pnl > 0) return `rgba(61,186,132,${Math.min(0.9, 0.25 + pnl / 40)})`;
-  if (pnl < 0) return `rgba(251,113,133,${Math.min(0.9, 0.25 + Math.abs(pnl) / 40)})`;
-  return chartTheme().empty;
+function utcDay(d) {
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
 }
 
-function renderHeat(days, selected, onPick) {
+function heatFill(pnl, maxAbs, empty) {
+  if (!pnl) return empty;
+  const t = Math.min(1, Math.abs(pnl) / Math.max(maxAbs, 0.01));
+  const a = 0.22 + t * 0.78;
+  if (pnl > 0) return `rgba(57, 211, 83, ${a})`;
+  return `rgba(248, 81, 73, ${a})`;
+}
+
+function renderHeat(days, selected, onPick, startMs) {
   const host = $("heat");
   if (!host) return;
-  const today = new Date();
-  today.setUTCHours(0, 0, 0, 0);
-  const start = new Date(today);
-  start.setUTCDate(start.getUTCDate() - 20 * 7);
-  const cell = 12, gap = 3, left = 28, top = 18;
-  const cols = 21;
-  const th = chartTheme();
-  let svg = `<svg class="heat-svg" width="${left + cols * (cell + gap)}" height="${top + 7 * (cell + gap)}">`;
-  MONTHS.forEach((m, i) => {
-    const x = left + i * ((cols * (cell + gap)) / 12);
-    svg += `<text x="${x}" y="12" fill="${th.month}" font-size="10">${m}</text>`;
-  });
+  const today = utcDay(new Date());
   const map = days || {};
+  const keys = Object.keys(map).sort();
+  let origin = startMs > 0 ? utcDay(new Date(startMs)) : today;
+  if (keys.length) {
+    const first = utcDay(new Date(keys[0] + "T00:00:00Z"));
+    if (first < origin) origin = first;
+  }
+  const start = utcDay(origin);
+  start.setUTCDate(start.getUTCDate() - start.getUTCDay());
+  const cols = Math.max(1, Math.floor((today - start) / (7 * 86400000)) + 1);
+  const cell = cols <= 8 ? 14 : cols <= 26 ? 12 : 11;
+  const gap = 3, left = 18, top = 18;
+  const th = chartTheme();
+  let maxAbs = 0;
+  keys.forEach((k) => {
+    maxAbs = Math.max(maxAbs, Math.abs(Number(map[k].pnl) || 0));
+  });
+  const w = left + cols * (cell + gap);
+  const h = top + 7 * (cell + gap) + 4;
+  let svg = `<svg class="heat-svg" width="${w}" height="${h}">`;
+  DOW.forEach((d, i) => {
+    if (i % 2) svg += `<text x="0" y="${top + i * (cell + gap) + 9}" fill="${th.month}" font-size="9">${d}</text>`;
+  });
+  let lastMonth = -1;
   for (let c = 0; c < cols; c++) {
     for (let r = 0; r < 7; r++) {
       const d = new Date(start);
       d.setUTCDate(d.getUTCDate() + c * 7 + r);
       if (d > today) continue;
       const key = d.toISOString().slice(0, 10);
-      const rec = map[key] || { pnl: 0, n: 0 };
+      if (r === 0 && d.getUTCMonth() !== lastMonth) {
+        lastMonth = d.getUTCMonth();
+        svg += `<text x="${left + c * (cell + gap)}" y="12" fill="${th.month}" font-size="10">${MONTHS[lastMonth]}</text>`;
+      }
       const x = left + c * (cell + gap);
       const y = top + r * (cell + gap);
-      const on = key === selected ? "stroke:#f5c451;stroke-width:1.5" : `stroke:${th.border}`;
-      svg += `<rect data-day="${key}" x="${x}" y="${y}" width="${cell}" height="${cell}" rx="2" fill="${heatColor(rec.pnl)}" ${on}></rect>`;
+      if (d < origin) {
+        svg += `<rect x="${x}" y="${y}" width="${cell}" height="${cell}" rx="2" fill="${th.empty}" stroke="${th.border}" opacity="0.45"></rect>`;
+        continue;
+      }
+      const rec = map[key];
+      const pnl = rec ? Number(rec.pnl) || 0 : 0;
+      const on = key === selected ? "stroke:#f5c451;stroke-width:1.6" : `stroke:${th.border}`;
+      const title = rec ? `${key} · ${moneyPnl(pnl)} · ${rec.n} windows` : key;
+      svg += `<rect data-day="${key}" x="${x}" y="${y}" width="${cell}" height="${cell}" rx="2" fill="${heatFill(rec ? pnl : 0, maxAbs, th.empty)}" ${on}><title>${title}</title></rect>`;
     }
   }
   svg += "</svg>";
@@ -603,65 +658,100 @@ function renderDayTable(results, day) {
     const k = new Date(r.ts_ms).toISOString().slice(0, 10);
     return k === day;
   });
-  $("dayLabel").textContent = day || "—";
+  const sum = rows.reduce((s, r) => s + Number(r.pnl || 0), 0);
+  if ($("dayLabel")) $("dayLabel").textContent = day || "—";
+  if ($("daySum")) {
+    $("daySum").textContent = rows.length ? moneyPnl(sum) : "—";
+    $("daySum").classList.toggle("pos", sum > 0);
+    $("daySum").classList.toggle("neg", sum < 0);
+  }
   body.innerHTML = rows.length
     ? rows.map((r) => {
         const cls = r.pnl >= 0 ? "pos" : "neg";
-        return `<tr><td>${new Date(r.ts_ms).toISOString().slice(11, 19)}</td><td>${r.slug || ""}</td><td class="${cls}">${fmt(r.pnl, 2)}</td><td>${r.paper ? "paper" : "live"}</td></tr>`;
+        return `<tr><td>${new Date(r.ts_ms).toISOString().slice(11, 19)}</td><td>${r.slug || ""}</td><td class="${cls}">${moneyPnl(r.pnl)}</td></tr>`;
       }).join("")
-    : `<tr><td colspan="4">No windows this day.</td></tr>`;
+    : `<tr><td colspan="3">${tr("pnl.emptyDay")}</td></tr>`;
 }
 
 function renderFills(fills) {
   const body = $("fillRows");
   if (!body) return;
   body.innerHTML = (fills || []).slice(0, 24).map((f) =>
-    `<tr><td>${new Date(f.ts_ms).toISOString().slice(11, 19)}</td><td>${f.kind}</td><td>${f.token}</td><td>${fmt(f.size, 1)}</td><td>${fmt(f.px, 3)}</td><td>${f.paper ? "paper" : "live"}</td></tr>`
-  ).join("") || `<tr><td colspan="6">No fills yet.</td></tr>`;
+    `<tr><td>${new Date(f.ts_ms).toISOString().slice(11, 19)}</td><td>${f.kind}</td><td>${f.token}</td><td>${fmt(f.size, 1)}</td><td>${fmt(f.px, 3)}</td></tr>`
+  ).join("") || `<tr><td colspan="5">No fills yet.</td></tr>`;
 }
 
-let eqChart;
 function renderEquity(equity) {
   if (typeof Chart === "undefined" || !$("cEq")) return;
-  const labels = (equity || []).map((e) => tlabel(e.ts));
-  const data = (equity || []).map((e) => e.cash);
+  const data = (equity || []).map((e) => ({ x: e.ts, y: e.cum != null ? e.cum : e.pnl }));
+  const th = chartTheme();
+  const last = data.length ? data[data.length - 1].y : 0;
+  const color = last >= 0 ? "#3fb950" : "#f85149";
   if (!eqChart) {
     const opt = chartCommon();
-    opt.parsing = true;
-    opt.scales.x = {
-      ...opt.scales.x,
-      type: "category",
-      ticks: { ...opt.scales.x.ticks, callback: undefined },
+    opt.plugins.legend.display = false;
+    opt.plugins.tooltip.callbacks = {
+      title: (items) => items[0] ? new Date(items[0].parsed.x).toISOString().replace("T", " ").slice(0, 19) : "",
+      label: (item) => moneyPnl(item.parsed.y),
     };
-    opt.plugins.tooltip.callbacks = {};
+    opt.scales.x.ticks.callback = (v) => {
+      const d = new Date(v);
+      return `${d.getUTCMonth() + 1}/${d.getUTCDate()} ${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
+    };
     eqChart = new Chart($("cEq"), {
       type: "line",
-      data: { labels, datasets: [dsLine("Cash", "#6ee7b7")] },
+      data: { datasets: [dsLine("PnL", color, { fill: "origin", backgroundColor: color + "33" })] },
       options: opt,
     });
-  } else {
-    eqChart.data.labels = labels;
-    eqChart.data.datasets[0].data = data;
-    eqChart.update("none");
   }
+  eqChart.data.datasets[0].data = data;
+  eqChart.data.datasets[0].borderColor = color;
+  eqChart.data.datasets[0].backgroundColor = color + "33";
+  if (data.length) {
+    eqChart.options.scales.x.min = data[0].x;
+    eqChart.options.scales.x.max = data[data.length - 1].x;
+  }
+  fitY(eqChart, 0.18, 1, true);
+  eqChart.update("none");
+  const _ = th;
 }
 
 async function loadPnl() {
   const d = await api("/api/pnl");
   const days = d.days || {};
-  let selected = new Date().toISOString().slice(0, 10);
   const keys = Object.keys(days).sort();
-  if (keys.length && !days[selected]) selected = keys[keys.length - 1];
+  const startMs = Number(d.sessionStartedAt) || 0;
+  let selected = keys.length ? keys[keys.length - 1] : new Date().toISOString().slice(0, 10);
   const pick = (day) => {
     selected = day;
-    renderHeat(days, selected, pick);
+    renderHeat(days, selected, pick, startMs);
     renderDayTable(d.results || [], selected);
   };
-  renderHeat(days, selected, pick);
+  renderHeat(days, selected, pick, startMs);
   renderDayTable(d.results || [], selected);
-  renderFills(d.fills || []);
   renderEquity(d.equity || []);
-  if ($("pnlCash")) $("pnlCash").textContent = moneyWhole(d.paperCashUsd);
+  paintPnlEl($("pnlSession"), d.pnl);
+  const live = d.mode === "live";
+  const fills = $("fillSection");
+  if (fills) {
+    fills.hidden = !live;
+    if (live) renderFills(d.fills || []);
+  }
+}
+
+function bindRanges() {
+  const host = $("chartRanges");
+  if (!host) return;
+  host.querySelectorAll("button").forEach((btn) => {
+    btn.onclick = () => {
+      WINDOW_MS = Number(btn.getAttribute("data-range")) || WINDOW_MS;
+      userZoomed = false;
+      host.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b === btn));
+      if (btc) btc.resetZoom && btc.resetZoom();
+      if (yn) yn.resetZoom && yn.resetZoom();
+      if (sig) sig.resetZoom && sig.resetZoom();
+    };
+  });
 }
 
 function vipBlocked() {
@@ -684,6 +774,7 @@ async function loadMe() {
     await loadMe();
     if (vipBlocked()) return;
     await loadBalance();
+    bindRanges();
     if (page === "dash") {
       ensureCharts();
       startDrawLoop();

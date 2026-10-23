@@ -95,6 +95,27 @@ fn signer_on_file(m: &Member) -> bool {
     m.keys.as_ref().is_some_and(|k| !k.key_enc.is_empty())
 }
 
+/// `MAX_NET=0` is uncapped. Never lift a zero cap up to BASE.
+fn net_cap(max_net: f64, base: f64) -> f64 {
+    if max_net <= 0.0 {
+        0.0
+    } else {
+        max_net.max(base.max(MIN_BASE))
+    }
+}
+
+fn take_size(max_net: f64, net: f64, long: bool, base: f64) -> f64 {
+    if max_net <= 0.0 {
+        return base;
+    }
+    let room = if long {
+        (max_net - net).max(0.0)
+    } else {
+        (max_net + net).max(0.0)
+    };
+    room.min(base)
+}
+
 impl Tenant {
     fn from_member(m: &Member) -> Self {
         Self {
@@ -106,7 +127,7 @@ impl Tenant {
             live: m.run_flags().live_running() && signer_on_file(m),
             plan: m.plan.clone(),
             base_amount: m.base_amount.max(MIN_BASE),
-            max_net: m.max_net.max(m.base_amount.max(MIN_BASE)),
+            max_net: net_cap(m.max_net, m.base_amount),
             hedge: m.hedge,
             last_snap_ms: 0,
             seq: 1,
@@ -117,6 +138,29 @@ impl Tenant {
 fn apply_buy(pos: &mut Position, token: TokenRef, px: f64, size: f64, fee_bps: u32) {
     let fee = size * px * (fee_bps as f64) / 10_000.0;
     pos.add(token, px, size, fee);
+}
+
+fn fill_slug(house: &Engine) -> String {
+    house
+        .state
+        .info
+        .as_ref()
+        .map(|i| i.slug.clone())
+        .unwrap_or_default()
+}
+
+fn slug_unix_s(slug: &str) -> Option<i64> {
+    slug.rsplit('-').next()?.parse().ok()
+}
+
+fn yes_mid(hs: &mm_engine::MarketSnap) -> f64 {
+    if hs.book_mid > 0.0 {
+        hs.book_mid
+    } else if hs.yes_bid > 0.0 && hs.yes_ask >= hs.yes_bid {
+        0.5 * (hs.yes_bid + hs.yes_ask)
+    } else {
+        0.0
+    }
 }
 
 pub async fn run(args: CoordArgs) -> Result<()> {
@@ -156,19 +200,24 @@ pub async fn run(args: CoordArgs) -> Result<()> {
     let mut last_fleet_try = now_ms() as u64;
 
     let mut tenants: HashMap<String, Tenant> = HashMap::new();
-    let mut last_sync = 0u64;
+    let _ = refresh_tenants(&members, &mut tenants).await;
+    seed_positions(&fills, &mut tenants, &market.slug).await;
+    let mut last_sync = now_ms() as u64;
     let mut last_tick_ms = 0u64;
     let mut last_roll_try = 0u64;
     let mut settled: HashSet<String> = HashSet::new();
     let mut yes_bid_sz = 0.0;
     let mut yes_ask_sz = 0.0;
+    let mut n_ev = 0u32;
     tracing::info!("trade-coordinator running (shared MD, pro-rata)");
 
     loop {
-        let dated = match hub.rx.recv_timeout(Duration::from_millis(50)) {
+        // try_recv + sleep: never park a Tokio worker on a blocking recv.
+        let dated = match hub.rx.try_recv() {
             Ok(d) => d,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+            Err(crossbeam_channel::TryRecvError::Empty) => {
                 sync_if_due(&members, &mut tenants, &mut last_sync).await;
+                house.cfg.hedge = tenants.values().any(|t| t.hedge);
                 let now = now_ms() as u64;
                 ensure_fleet(
                     &mut fleet,
@@ -199,10 +248,15 @@ pub async fn run(args: CoordArgs) -> Result<()> {
                     write_tick(&ticks, &house, now).await;
                     write_snaps(&house, &mut tenants, &snaps, now).await;
                 }
+                tokio::time::sleep(Duration::from_millis(20)).await;
                 continue;
             }
             Err(_) => break,
         };
+        n_ev = n_ev.wrapping_add(1);
+        if n_ev % 64 == 0 {
+            tokio::task::yield_now().await;
+        }
         let now = now_ms() as u64;
         ensure_fleet(
             &mut fleet,
@@ -218,6 +272,7 @@ pub async fn run(args: CoordArgs) -> Result<()> {
             yes_bid_sz = d.bids[0].size;
             yes_ask_sz = d.asks[0].size;
         }
+        house.cfg.hedge = tenants.values().any(|t| t.hedge);
         let cmds = house.on_event(ev.clone(), now);
         let _ = house.paper_on_market(&mut house_venue, &mut house_ledger, &ev, now);
         let more = house.paper_follow(&mut house_venue, &mut house_ledger, &cmds, now);
@@ -241,13 +296,7 @@ pub async fn run(args: CoordArgs) -> Result<()> {
             let budget = wave_budget(touch, args.max_wave);
             let mut cands = Vec::new();
             for t in tenants.values() {
-                let net = t.position.net();
-                let room = if long {
-                    (t.max_net - net).max(0.0)
-                } else {
-                    (t.max_net + net).max(0.0)
-                };
-                let requested = room.min(t.base_amount);
+                let requested = take_size(t.max_net, t.position.net(), long, t.base_amount);
                 if requested + 1e-9 >= MIN_SIZE {
                     cands.push(Candidate {
                         tenant_id: t.email.clone(),
@@ -312,6 +361,7 @@ pub async fn run(args: CoordArgs) -> Result<()> {
                         px,
                         kind: "taker".into(),
                         paper: true,
+                        slug: fill_slug(&house),
                     });
                     member_sets.push((
                         t.email.clone(),
@@ -330,6 +380,7 @@ pub async fn run(args: CoordArgs) -> Result<()> {
                 fee_bps,
                 now,
                 true,
+                &fill_slug(&house),
             )
             .await;
             for row in fill_rows {
@@ -400,6 +451,7 @@ pub async fn run(args: CoordArgs) -> Result<()> {
                         px,
                         kind: "hedge".into(),
                         paper: true,
+                        slug: fill_slug(&house),
                     });
                 }
             }
@@ -413,6 +465,7 @@ pub async fn run(args: CoordArgs) -> Result<()> {
                 fee_bps,
                 now,
                 false,
+                &fill_slug(&house),
             )
             .await;
             for row in fill_rows {
@@ -420,10 +473,10 @@ pub async fn run(args: CoordArgs) -> Result<()> {
             }
         }
 
-        write_snaps(&house, &mut tenants, &snaps, now).await;
         if now.saturating_sub(last_tick_ms) >= 1_000 {
             last_tick_ms = now;
             write_tick(&ticks, &house, now).await;
+            write_snaps(&house, &mut tenants, &snaps, now).await;
         }
         maybe_roll(
             &mut house,
@@ -493,7 +546,9 @@ async fn settle_window(
     now: u64,
 ) {
     let hs = house.market_snap(now);
-    let close = if hs.chainlink > 0.0 {
+    let close = if house.state.settle_twap > 0.0 {
+        house.state.settle_twap
+    } else if hs.chainlink > 0.0 {
         hs.chainlink
     } else {
         hs.twap
@@ -501,6 +556,20 @@ async fn settle_window(
     let up = close > hs.k_t;
     let _ = house.on_event(Event::Settle { close }, now);
     for t in tenants.values_mut() {
+        let already = results
+            .find_one(doc! { "email": &t.email, "slug": &hs.slug }, None)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        if already {
+            t.position = Position::default();
+            continue;
+        }
+        if t.position.long_qty.abs() <= 1e-12 && t.position.short_qty.abs() <= 1e-12 {
+            t.position = Position::default();
+            continue;
+        }
         let pnl = t.position.settle_pnl(up);
         let _ = results
             .insert_one(
@@ -553,10 +622,15 @@ async fn maybe_roll(
     now: u64,
 ) {
     let hs = house.market_snap(now);
-    if hs.slug.is_empty() || hs.utc1_ms == 0 {
+    if hs.slug.is_empty() {
         return;
     }
-    if now < hs.utc1_ms {
+    let unix = mm_md::current_bucket_unix_s(mins).await;
+    let window_over = match slug_unix_s(&hs.slug) {
+        Some(u) => u != unix,
+        None => hs.utc1_ms > 0 && now >= hs.utc1_ms,
+    };
+    if !window_over {
         return;
     }
     if now.saturating_sub(*last_try) < 3_000 {
@@ -567,12 +641,16 @@ async fn maybe_roll(
         settle_window(house, tenants, members, results, now).await;
         settled.insert(hs.slug.clone());
     }
-    let unix = mm_md::current_bucket_unix_s(mins).await;
-    if (unix as u64).saturating_mul(1000) == hs.utc0_ms {
-        return;
-    }
-    match crate::quotes::current_market(base, mins).await {
-        Ok(market) => {
+    match tokio::time::timeout(
+        Duration::from_secs(6),
+        crate::quotes::current_market(base, mins),
+    )
+    .await
+    {
+        Ok(Ok(market)) => {
+            if market.slug == hs.slug {
+                return;
+            }
             let _ = house.on_event(Event::LoadContract(market.info.clone()), now);
             let _ = assets_tx.send((market.yes_id_dec.clone(), market.no_id_dec.clone()));
             *hello = FleetHello::from_market(&market);
@@ -583,7 +661,8 @@ async fn maybe_roll(
             }
             tracing::info!(slug = %market.slug, k = market.info.k_t, "rolled window");
         }
-        Err(e) => tracing::warn!(error = %e, "next contract"),
+        Ok(Err(e)) => tracing::warn!(error = %e, "next contract"),
+        Err(_) => tracing::warn!("next contract timed out"),
     }
 }
 
@@ -636,7 +715,7 @@ async fn write_snaps(
             yes_bid: hs.yes_bid,
             yes_ask: hs.yes_ask,
             net: t.position.net(),
-            mark_pnl: t.position.mark_pnl(hs.book_mid),
+            mark_pnl: t.position.mark_pnl(yes_mid(&hs)),
             tau_s: hs.tau_s,
             quote: hs.quote.to_string(),
             alloc: t.last_alloc.clone(),
@@ -676,6 +755,40 @@ async fn sync_if_due(
     }
 }
 
+async fn seed_positions(
+    fills: &Collection<FillRow>,
+    tenants: &mut HashMap<String, Tenant>,
+    slug: &str,
+) {
+    if slug.is_empty() || tenants.is_empty() {
+        return;
+    }
+    let mut cur = match fills.find(doc! { "slug": slug }, None).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "seed fills");
+            return;
+        }
+    };
+    while let Ok(Some(f)) = cur.try_next().await {
+        let Some(t) = tenants.get_mut(&f.email) else {
+            continue;
+        };
+        if t.live && f.paper {
+            continue;
+        }
+        if t.paper && !f.paper {
+            continue;
+        }
+        let token = if f.token.eq_ignore_ascii_case("yes") || f.token.eq_ignore_ascii_case("up") {
+            TokenRef::Yes
+        } else {
+            TokenRef::No
+        };
+        t.position.add(token, f.px, f.size, 0.0);
+    }
+}
+
 async fn refresh_tenants(
     col: &Collection<Member>,
     tenants: &mut HashMap<String, Tenant>,
@@ -700,7 +813,7 @@ async fn refresh_tenants(
     for m in live {
         if let Some(t) = tenants.get_mut(&m.email) {
             t.base_amount = m.base_amount.max(MIN_BASE);
-            t.max_net = m.max_net.max(t.base_amount);
+            t.max_net = net_cap(m.max_net, t.base_amount);
             t.hedge = m.hedge;
             t.paper = m.run_flags().paper_running() || (m.live && !signer_on_file(&m));
             t.live = m.run_flags().live_running() && signer_on_file(&m);
@@ -838,6 +951,7 @@ async fn book_live_replies(
     fee_bps: u32,
     now: u64,
     bump_deficit_on_miss: bool,
+    slug: &str,
 ) {
     for r in replies {
         match r {
@@ -876,6 +990,7 @@ async fn book_live_replies(
                             px: fill_px,
                             kind: p.kind.into(),
                             paper: false,
+                            slug: slug.to_string(),
                         },
                         None,
                     )

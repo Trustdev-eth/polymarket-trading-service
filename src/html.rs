@@ -20,8 +20,8 @@ fn theme_toggle() -> &'static str {
 }
 
 fn chrome_js() -> &'static str {
-    r#"<script src="/i18n.js?v=i18n6"></script>
-<script src="/theme.js?v=i18n6"></script>"#
+    r#"<script src="/i18n.js?v=i18n7"></script>
+<script src="/theme.js?v=i18n7"></script>"#
 }
 
 fn brand_mark(admin_site: bool) -> &'static str {
@@ -173,8 +173,8 @@ fn app_header(email: &str, admin: bool, admin_href: &str, page: &str) -> String 
         <div class="head-ticker">
           <span class="head-chip">BTC 15m</span>
           <div class="head-acct">
-            <span><span data-i18n="acct.cash">Cash</span> <b id="acctCash">—</b></span>
-            <span><span data-i18n="acct.port">Portfolio</span> <b id="acctPort">—</b></span>
+            <span id="acctBalWrap" hidden><span data-i18n="acct.bal">Balance</span> <b id="acctCash">—</b></span>
+            <span><span data-i18n="acct.pnl">PnL</span> <b id="acctPnl">—</b></span>
           </div>
           <span class="head-mode" id="headMode">—</span>
         </div>
@@ -222,7 +222,9 @@ fn chart_shell(title: &str, nav: &str, body: &str, scripts: &str) -> Html<String
 
 fn dash_shell_ex(title: &str, nav: &str, body: &str, scripts: &str, charts: bool) -> Html<String> {
     let chart = if charts {
-        r#"<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>"#
+        r#"<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.2.0/dist/chartjs-plugin-zoom.min.js"></script>"#
     } else {
         ""
     };
@@ -235,7 +237,7 @@ fn dash_shell_ex(title: &str, nav: &str, body: &str, scripts: &str, charts: bool
 <title>{title}</title>
 {boot}
 <link rel="stylesheet" href="/app.css?v=hdr4">
-<link rel="stylesheet" href="/dash.css?v=hdr1">
+<link rel="stylesheet" href="/dash.css?v=pnl3">
 <link rel="icon" href="/ohioismquant-logo.png" type="image/png">
 {chart}
 </head>
@@ -538,7 +540,7 @@ pub fn desk(email: &str, admin: bool, admin_href: &str, vip: bool) -> Html<Strin
     <div class="metric"><span data-i18n="desk.plan">Plan</span><b id="plan">—</b></div>
     <div class="metric"><span data-i18n="desk.access">Access</span><b id="left">—</b></div>
     <div class="metric"><span data-i18n="desk.mode">Mode</span><b id="mode">—</b></div>
-    <div class="metric"><span data-i18n="desk.paperCash">Paper cash</span><b id="paperCash">—</b></div>
+    <div class="metric"><span data-i18n="acct.pnl">PnL</span><b id="deskPnl">—</b></div>
   </div>
   <div class="desk-grid desk-grid-2{locked}" id="deskMain">
     <section class="panel">
@@ -549,7 +551,7 @@ pub fn desk(email: &str, admin: bool, admin_href: &str, vip: bool) -> Html<Strin
       <input id="setBase" type="number" min="5" step="1" placeholder="5">
       <label data-i18n="desk.fund">Necessary fund</label>
       <p class="fund-readout" id="needFund">$200</p>
-      <label class="check-row"><input id="setHedge" type="checkbox" checked> <span data-i18n="desk.hedge">Hedge leftover (flatten after the take)</span></label>
+      <label class="check-row"><input id="setHedge" type="checkbox"> <span data-i18n="desk.hedge">Hedge leftover (flatten after the take)</span></label>
       <div class="btn-row" style="margin-top:12px">
         <button class="btn" id="saveParams" type="button" data-i18n="desk.saveSize">Save my size</button>
       </div>
@@ -617,10 +619,18 @@ pub fn dash(email: &str, admin: bool, admin_href: &str, vip: bool) -> Html<Strin
   <div class="run-banner stopped" id="runBanner" data-i18n-html="banner.stop">Stopped · start paper or live on the <a href="/desk">desk</a>.</div>
   <div class="dash-stats" id="stats"></div>
   <div class="dash-meta" id="meta"></div>
-  <section class="chart-pane"><h3 data-i18n="dash.price">Price</h3><canvas id="cBtc"></canvas></section>
-  <section class="chart-pane"><h3 data-i18n="dash.yn">Yes / No</h3><canvas id="cYn"></canvas></section>
-  <section class="chart-pane"><h3 data-i18n="dash.sig">Signal Ŝ</h3><canvas id="cSig"></canvas></section>
-  <section class="heat-wrap" style="margin-top:16px">
+  <div class="chart-toolbar">
+    <span data-i18n="dash.range">Range</span>
+    <div class="chart-ranges" id="chartRanges">
+      <button type="button" data-range="120000">2m</button>
+      <button type="button" data-range="480000" class="on">8m</button>
+      <button type="button" data-range="900000">15m</button>
+    </div>
+  </div>
+  <section class="chart-pane chart-flex"><h3 data-i18n="dash.price">Price</h3><div class="chart-canvas-wrap"><canvas id="cBtc"></canvas></div></section>
+  <section class="chart-pane chart-flex"><h3 data-i18n="dash.yn">Yes / No</h3><div class="chart-canvas-wrap"><canvas id="cYn"></canvas></div></section>
+  <section class="chart-pane chart-flex"><h3 data-i18n="dash.sig">Signal Ŝ</h3><div class="chart-canvas-wrap"><canvas id="cSig"></canvas></div></section>
+  <section class="heat-wrap" id="fillSection" hidden>
     <h3 data-i18n="dash.fills">Recent fills</h3>
     <table class="day-table"><thead><tr><th data-i18n="dash.utc">UTC</th><th data-i18n="dash.kind">Kind</th><th data-i18n="dash.tok">Tok</th><th data-i18n="dash.sz">Sz</th><th data-i18n="dash.px">Px</th><th></th></tr></thead><tbody id="fillRows"></tbody></table>
   </section>
@@ -631,7 +641,7 @@ pub fn dash(email: &str, admin: bool, admin_href: &str, vip: bool) -> Html<Strin
         "Dashboard · Trade",
         &app_header(email, admin, admin_href, "dash"),
         &body,
-        r#"<script src="/dash.js?v=hdr1"></script>"#,
+        r#"<script src="/dash.js?v=pnl4"></script>"#,
     )
 }
 
@@ -643,24 +653,34 @@ pub fn pnl(email: &str, admin: bool, admin_href: &str, vip: bool) -> Html<String
   <div class="heat-head">
     <div>
       <p class="eyebrow" data-i18n="pnl.eye">PnL</p>
-      <h2 data-i18n="pnl.h">BTC 15m windows</h2>
+      <h2 data-i18n="pnl.h">BTC 15m</h2>
     </div>
-    <p><span data-i18n="pnl.cash">Paper cash</span> <b id="pnlCash">—</b></p>
+    <div class="pnl-totals">
+      <span><span data-i18n="acct.pnl">PnL</span> <b id="pnlSession">—</b></span>
+      <span id="pnlBalWrap" hidden><span data-i18n="acct.bal">Balance</span> <b id="pnlBal">—</b></span>
+    </div>
   </div>
   <div class="pnl-grid">
     <section class="heat-wrap">
-      <div id="heat"></div>
-      <p class="note" data-i18n="pnl.heat">Click a day. Green is net positive windows, red is negative.</p>
+      <p class="heat-title" data-i18n="pnl.daily">Daily PnL</p>
+      <div id="heat" class="heat-scroll"></div>
+      <p class="note" data-i18n="pnl.heat">Click a day for that day's markets. Green is net up, red is down.</p>
     </section>
-    <section class="heat-wrap">
-      <h3 id="dayLabel">—</h3>
-      <table class="day-table"><thead><tr><th data-i18n="dash.utc">UTC</th><th data-i18n="pnl.slug">Slug</th><th data-i18n="nav.pnl">PnL</th><th></th></tr></thead><tbody id="dayRows"></tbody></table>
+    <section class="chart-pane pnl-eq-pane">
+      <h3 data-i18n="pnl.equity">Session PnL</h3>
+      <div class="chart-canvas-wrap"><canvas id="cEq"></canvas></div>
     </section>
   </div>
-  <section class="chart-pane" style="margin-top:16px;height:220px"><h3 data-i18n="pnl.equity">Equity</h3><canvas id="cEq"></canvas></section>
-  <section class="heat-wrap" style="margin-top:16px">
+  <section class="heat-wrap" id="dayPanel">
+    <div class="day-head">
+      <h3 id="dayLabel">—</h3>
+      <p id="daySum" class="day-sum">—</p>
+    </div>
+    <table class="day-table"><thead><tr><th data-i18n="dash.utc">UTC</th><th data-i18n="pnl.slug">Market</th><th data-i18n="nav.pnl">PnL</th></tr></thead><tbody id="dayRows"></tbody></table>
+  </section>
+  <section class="heat-wrap" id="fillSection" hidden>
     <h3 data-i18n="pnl.fills">Fills</h3>
-    <table class="day-table"><thead><tr><th data-i18n="dash.utc">UTC</th><th data-i18n="dash.kind">Kind</th><th data-i18n="dash.tok">Tok</th><th data-i18n="dash.sz">Sz</th><th data-i18n="dash.px">Px</th><th></th></tr></thead><tbody id="fillRows"></tbody></table>
+    <table class="day-table"><thead><tr><th data-i18n="dash.utc">UTC</th><th data-i18n="dash.kind">Kind</th><th data-i18n="dash.tok">Tok</th><th data-i18n="dash.sz">Sz</th><th data-i18n="dash.px">Px</th></tr></thead><tbody id="fillRows"></tbody></table>
   </section>
 </main>"#,
         gate = vip_gate(vip)
@@ -669,7 +689,7 @@ pub fn pnl(email: &str, admin: bool, admin_href: &str, vip: bool) -> Html<String
         "PnL · Trade",
         &app_header(email, admin, admin_href, "pnl"),
         &body,
-        r#"<script src="/dash.js?v=hdr1"></script>"#,
+        r#"<script src="/dash.js?v=pnl4"></script>"#,
     )
 }
 

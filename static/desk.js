@@ -184,8 +184,8 @@ function capsOf(guide) {
   return {
     plan: c.plan || lastMember.plan || "test",
     base: Number(c.base) || 5,
-    maxNet: Number(c.maxNet) || 15,
-    hedge: c.hedge !== false,
+    maxNet: Number.isFinite(Number(c.maxNet)) ? Number(c.maxNet) : 0,
+    hedge: c.hedge === true,
   };
 }
 
@@ -193,7 +193,7 @@ function typedSize() {
   const caps = capsOf(lastGuide);
   const raw = $("setBase") ? String($("setBase").value || "").trim() : "";
   let base = raw === "" ? 5 : Number(raw);
-  const hedge = $("setHedge") ? $("setHedge").checked : true;
+  const hedge = $("setHedge") ? $("setHedge").checked : false;
   if (!Number.isFinite(base) || base <= 0) base = 5;
   const clampedBase = Math.min(caps.base, Math.max(5, Math.round(base)));
   return { base: clampedBase, hedge, rawBase: raw === "" ? 5 : base, caps };
@@ -222,7 +222,7 @@ function fillParams(me, guide) {
     $("setBase").value = v;
   }
   if ($("setHedge") && document.activeElement !== $("setHedge")) {
-    $("setHedge").checked = me.hedge !== false;
+    $("setHedge").checked = me.hedge === true;
   }
 }
 
@@ -278,12 +278,30 @@ function renderModeCards(me) {
   }
 }
 
+function moneyPnl(n) {
+  if (n == null || !isFinite(Number(n))) return "—";
+  const v = Number(n);
+  const abs = Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return (v > 0 ? "+" : v < 0 ? "−" : "") + "$" + abs;
+}
+
 async function loadBalance() {
   try {
     const b = await api("/api/balance");
-    setText("acctCash", moneyWhole(b.cash));
-    setText("acctPort", moneyWhole(b.portfolio));
-    if (b.paperCashUsd != null) setText("paperCash", moneyWhole(b.paperCashUsd));
+    const live = b.mode === "live" && !b.paper;
+    const wrap = document.getElementById("acctBalWrap");
+    if (wrap) wrap.hidden = !live;
+    if (live && $("acctCash")) setText("acctCash", moneyWhole(b.balance != null ? b.balance : b.cash));
+    if ($("acctPnl")) {
+      $("acctPnl").textContent = moneyPnl(b.pnl);
+      $("acctPnl").classList.toggle("pos", Number(b.pnl) > 0);
+      $("acctPnl").classList.toggle("neg", Number(b.pnl) < 0);
+    }
+    if ($("deskPnl")) {
+      $("deskPnl").textContent = moneyPnl(b.pnl);
+      $("deskPnl").classList.toggle("pos", Number(b.pnl) > 0);
+      $("deskPnl").classList.toggle("neg", Number(b.pnl) < 0);
+    }
   } catch (_) {}
 }
 
@@ -296,7 +314,6 @@ function render(me, snap, house, fills, guide) {
   setText("plan", me.plan || "none");
   setText("left", remaining(me.accessUntil));
   setText("mode", t("mode." + modeLabel(me)));
-  setText("paperCash", moneyWhole(me.paperCashUsd));
   setHeadMode(me);
   renderModeCards(me);
   if ($("keysStatus")) {

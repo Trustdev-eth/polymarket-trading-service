@@ -20,6 +20,8 @@ pub struct State {
     pub bba_ts_ms: u64,
     /// True when `bba_ts_ms` last came from Binance (not Chainlink fallback).
     pub bba_from_binance: bool,
+    /// Last Binance USDM mid. Never overwritten by Chainlink / TWAP.
+    pub binance_mid: f64,
     pub fast_mid: f64,
     pub s_hat: f64,
     pub last_s_hat: f64,
@@ -173,6 +175,8 @@ impl Engine {
         self.bands.clear();
         let s = &mut self.state;
         s.allow = AllowTrade::WaitingBook;
+        s.halt_until_ms = 0;
+        s.skip = None;
         s.var_fast = crate::math::INIT_VAR;
         s.var_slow = crate::math::INIT_VAR;
         s.var_countdown = 1;
@@ -217,6 +221,9 @@ impl Engine {
         let s = &mut self.state;
         s.bba_ts_ms = ts;
         s.bba_from_binance = from_binance;
+        if from_binance {
+            s.binance_mid = mid;
+        }
         if s.last_mid_for_delta > 0.0 {
             s.delta_ewma = ewma(DELTA_EWMA_ALPHA, mid - s.last_mid_for_delta, s.delta_ewma);
         }
@@ -473,7 +480,9 @@ impl Engine {
     fn on_invariant(&mut self, now_ms: u64, out: &mut Vec<Command>) {
         self.oms.expire(now_ms, self.cfg.order_timeout_ms);
         let oracle_ok = self.binance_bba_fresh(now_ms) || self.chainlink_fresh(now_ms);
-        if self.state.bba_ts_ms > 0 && !oracle_ok && now_ms.saturating_sub(self.state.bba_ts_ms) > self.cfg.bba_stale_ms
+        if oracle_ok {
+            self.state.halt_until_ms = 0;
+        } else if self.state.bba_ts_ms > 0 && now_ms.saturating_sub(self.state.bba_ts_ms) > self.cfg.bba_stale_ms
         {
             let until = now_ms + self.cfg.halt_ms;
             self.state.halt_until_ms = until;

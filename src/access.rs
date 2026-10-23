@@ -133,7 +133,7 @@ mod tests {
         assert_eq!(g.plan, "test");
         assert_eq!((g.until - t()).num_days(), 3);
         assert_eq!(g.base_amount, 5.0);
-        assert_eq!(g.max_net, 15.0);
+        assert_eq!(g.max_net, 0.0);
     }
 
     #[test]
@@ -143,7 +143,7 @@ mod tests {
         assert_eq!(g.plan, "month");
         assert_eq!((g.until - t()).num_days(), 30);
         assert_eq!(g.base_amount, 5.0);
-        assert_eq!(g.max_net, 15.0);
+        assert_eq!(g.max_net, 0.0);
     }
 
     #[test]

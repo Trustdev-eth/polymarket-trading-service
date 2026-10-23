@@ -20,7 +20,10 @@ pub async fn spawn(
     yes_id_dec: String,
     no_id_dec: String,
 ) -> Result<MdHub> {
-    let (tx, rx) = crossbeam_channel::bounded::<DatedEvent>(8192);
+    // Unbounded on purpose: Binance bookTicker is hundreds/sec. A bounded
+    // queue plus a blocking send deadlocks the Tokio workers (WS unread,
+    // Mongo replies unread, window never rolls).
+    let (tx, rx) = crossbeam_channel::unbounded::<DatedEvent>();
     {
         let (sym, tx) = (binance.to_string(), tx.clone());
         tokio::spawn(async move {

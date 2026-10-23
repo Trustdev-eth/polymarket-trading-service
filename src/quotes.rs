@@ -236,20 +236,20 @@ pub async fn binance_bba(http: &Client, symbol: &str) -> Result<(f64, f64)> {
 
 pub async fn chainlink_spot(http: &Client, base: &str) -> Result<f64> {
     let asset = base.trim().to_uppercase();
-    let cb = format!("https://api.exchange.coinbase.com/products/{asset}-USD/ticker");
-    if let Ok(v) = http_json(http, &cb).await {
-        if let Some(px) = parse_coinbase_ticker(&v) {
-            return Ok(px);
-        }
-    }
     let pair = if asset == "BTC" {
         "XBTUSD".to_string()
     } else {
         format!("{asset}USD")
     };
     let kr = format!("https://api.kraken.com/0/public/Ticker?pair={pair}");
-    let v = http_json(http, &kr).await?;
-    parse_kraken_ticker(&v).context("kraken ticker empty")
+    if let Ok(v) = http_json(http, &kr).await {
+        if let Some(px) = parse_kraken_ticker(&v) {
+            return Ok(px);
+        }
+    }
+    let cb = format!("https://api.exchange.coinbase.com/products/{asset}-USD/ticker");
+    let v = http_json(http, &cb).await?;
+    parse_coinbase_ticker(&v).context("coinbase ticker empty")
 }
 
 pub async fn clob_book(http: &Client, yes_id: &str) -> Result<(f64, f64, BookDepth)> {
@@ -276,28 +276,37 @@ pub async fn current_market(base: &str, mins: u32) -> Result<mm_md::ResolvedMark
 }
 
 async fn overlay_now(http: &Client, base: &str, mins: u32, binance_sym: &str) -> Result<Overlay> {
-    let market = current_market(base, mins).await?;
     let now = crate::db::now_ms();
     let mut out = Overlay {
-        slug: market.slug.clone(),
         ts_ms: now,
-        k_t: market.info.k_t,
-        utc0_ms: market.info.utc0_ms as i64,
-        utc1_ms: market.info.utc1_ms as i64,
-        tau_s: if market.info.utc1_ms > now as u64 {
+        ..Overlay::default()
+    };
+    // Prices must not wait on Gamma. A slow `/events` fetch froze Chainlink on the dash.
+    let market_f = tokio::time::timeout(Duration::from_secs(4), current_market(base, mins));
+    let (market, bn, cl) = tokio::join!(
+        market_f,
+        binance_bba(http, binance_sym),
+        chainlink_spot(http, base),
+    );
+    if let Ok(Ok(market)) = market {
+        out.slug = market.slug.clone();
+        out.k_t = market.info.k_t;
+        out.utc0_ms = market.info.utc0_ms as i64;
+        out.utc1_ms = market.info.utc1_ms as i64;
+        out.tau_s = if market.info.utc1_ms > now as u64 {
             (market.info.utc1_ms - now as u64) as f64 / 1000.0
         } else {
             0.0
-        },
-        yes_id: market.yes_id_dec.clone(),
-        no_id: market.no_id_dec.clone(),
-        ..Overlay::default()
-    };
-    let (bn, cl, book) = tokio::join!(
-        binance_bba(http, binance_sym),
-        chainlink_spot(http, base),
-        clob_book(http, &market.yes_id_dec),
-    );
+        };
+        out.yes_id = market.yes_id_dec.clone();
+        out.no_id = market.no_id_dec.clone();
+        if let Ok((yb, ya, _)) = clob_book(http, &market.yes_id_dec).await {
+            out.yes_bid = yb;
+            out.yes_ask = ya;
+            out.no_bid = (1.0 - ya).max(0.0);
+            out.no_ask = (1.0 - yb).max(0.0);
+        }
+    }
     if let Ok((bid, ask)) = bn {
         let mid = 0.5 * (bid + ask);
         out.binance = mid;
@@ -307,11 +316,8 @@ async fn overlay_now(http: &Client, base: &str, mins: u32, binance_sym: &str) ->
         out.chainlink = px;
         out.twap = note_chainlink(now as u64, px).await;
     }
-    if let Ok((yb, ya, _)) = book {
-        out.yes_bid = yb;
-        out.yes_ask = ya;
-        out.no_bid = (1.0 - ya).max(0.0);
-        out.no_ask = (1.0 - yb).max(0.0);
+    if out.binance <= 0.0 && out.chainlink <= 0.0 && out.yes_bid <= 0.0 {
+        anyhow::bail!("overlay empty");
     }
     Ok(out)
 }
@@ -344,30 +350,43 @@ pub fn merge_tick(tick: &mut serde_json::Value, o: &Overlay) {
     let cur = |obj: &serde_json::Map<String, Value>, k: &str| {
         obj.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0)
     };
-    let set_if = |obj: &mut serde_json::Map<String, Value>, k: &str, n: f64| {
-        if n > 0.0 && cur(obj, k) <= 0.0 {
-            obj.insert(k.into(), serde_json::json!(n));
-        }
-    };
     if !o.slug.is_empty() {
         obj.insert("slug".into(), serde_json::json!(o.slug));
     }
-    obj.insert("ts".into(), serde_json::json!(o.ts_ms));
-    set_if(obj, "binance", o.binance);
-    set_if(obj, "s_hat", o.s_hat);
-    set_if(obj, "yes_bid", o.yes_bid);
-    set_if(obj, "yes_ask", o.yes_ask);
-    set_if(obj, "no_bid", o.no_bid);
-    set_if(obj, "no_ask", o.no_ask);
-    set_if(obj, "k_t", o.k_t);
+    let tick_ts = obj.get("ts").and_then(|x| x.as_i64()).unwrap_or(0);
+    let stale = tick_ts <= 0 || o.ts_ms.saturating_sub(tick_ts) > 8_000;
+    if stale || tick_ts <= 0 {
+        obj.insert("ts".into(), serde_json::json!(o.ts_ms));
+    }
+    let set_live = |obj: &mut serde_json::Map<String, Value>, k: &str, n: f64, force: bool| {
+        if n > 0.0 && (force || cur(obj, k) <= 0.0) {
+            obj.insert(k.into(), serde_json::json!(n));
+        }
+    };
+    let prev_binance = cur(obj, "binance");
+    let prev_s_hat = cur(obj, "s_hat");
+    // Fresh engine ticks win. Overlay only fills zeros, copy-bugs, or a wedged snapshot.
+    set_live(obj, "binance", o.binance, stale);
+    set_live(obj, "yes_bid", o.yes_bid, stale);
+    set_live(obj, "yes_ask", o.yes_ask, stale);
+    set_live(obj, "no_bid", o.no_bid, stale);
+    set_live(obj, "no_ask", o.no_ask, stale);
+    set_live(obj, "k_t", o.k_t, stale);
+    if o.s_hat > 0.0 && (prev_s_hat <= 0.0 || copied(prev_s_hat, prev_binance)) {
+        obj.insert("s_hat".into(), serde_json::json!(o.s_hat));
+    }
     let binance = cur(obj, "binance");
     let k_t = cur(obj, "k_t");
     let chainlink = cur(obj, "chainlink");
-    if o.chainlink > 0.0 && (chainlink <= 0.0 || copied(chainlink, binance)) {
+    if o.chainlink > 0.0
+        && (stale || chainlink <= 0.0 || copied(chainlink, binance) || copied(chainlink, prev_binance))
+    {
         obj.insert("chainlink".into(), serde_json::json!(o.chainlink));
     }
     let twap = cur(obj, "twap");
-    if o.twap > 0.0 && (twap <= 0.0 || copied(twap, k_t) || copied(twap, binance)) {
+    if o.twap > 0.0
+        && (stale || twap <= 0.0 || copied(twap, k_t) || copied(twap, binance) || copied(twap, prev_binance))
+    {
         obj.insert("twap".into(), serde_json::json!(o.twap));
     }
     if o.tau_s > 0.0 {
@@ -415,9 +434,15 @@ pub async fn run_rest_feeds(
     };
     tracing::info!("rest md overlay (binance + chainlink spot + 60s twap)");
     let mut last_warn = Instant::now() - Duration::from_secs(60);
+    let mut last_cl = Instant::now() - Duration::from_secs(10);
     let mut latched_utc0 = 0u64;
+    let mut rest_bucket = 0u64;
+    let mut rest_yes = String::new();
     loop {
         let (yes, _) = assets_rx.borrow_and_update().clone();
+        if rest_yes.is_empty() && !yes.is_empty() && yes != "0" {
+            rest_yes = yes.clone();
+        }
         let now = now_ns() / 1_000_000;
         let unix = mm_md::current_bucket_unix_s(mins).await as u64;
         let utc0 = unix.saturating_mul(1000);
@@ -436,6 +461,16 @@ pub async fn run_rest_feeds(
                 }
             }
         }
+        if rest_bucket != utc0 {
+            rest_bucket = utc0;
+            if let Ok(Ok(m)) =
+                tokio::time::timeout(Duration::from_secs(5), current_market(&base, mins)).await
+            {
+                if !m.yes_id_dec.is_empty() {
+                    rest_yes = m.yes_id_dec;
+                }
+            }
+        }
         if let Ok((bid, ask)) = binance_bba(&http, &binance_sym).await {
             let _ = tx.send(DatedEvent {
                 recv_ns: now_ns(),
@@ -449,28 +484,44 @@ pub async fn run_rest_feeds(
             tracing::warn!("binance rest still blocked");
             last_warn = Instant::now();
         }
-        if let Ok(cl) = chainlink_spot(&http, &base).await {
-            let _ = tx.send(DatedEvent {
-                recv_ns: now_ns(),
-                event: Event::Chainlink {
-                    ts_ms: now,
-                    value: cl,
-                },
-            });
-            let tw = note_chainlink(now, cl).await;
-            let in_lock = now + 2_000 >= utc0 && now <= utc0 + 5_000;
-            if tw > 0.0 && (!in_lock || latched_utc0 == utc0) {
-                let _ = tx.send(DatedEvent {
-                    recv_ns: now_ns(),
-                    event: Event::Twap {
-                        ts_ms: now,
-                        value: tw,
-                    },
-                });
+        // Kraken/Coinbase is a fallback only. Never overwrite live RTDS Chainlink/TWAP —
+        // that is what made the dashboard Chainlink a stepped spot line $100 under Binance.
+        if last_cl.elapsed() >= Duration::from_secs(2) {
+            last_cl = Instant::now();
+            let rtds_cl = mm_md::rtds::chainlink_age_ms(now);
+            let rtds_tw = mm_md::rtds::twap_age_ms(now);
+            match chainlink_spot(&http, &base).await {
+                Ok(cl) => {
+                    if rtds_cl > 6_000 {
+                        let _ = tx.send(DatedEvent {
+                            recv_ns: now_ns(),
+                            event: Event::Chainlink {
+                                ts_ms: now,
+                                value: cl,
+                            },
+                        });
+                    }
+                    let tw = note_chainlink(now, cl).await;
+                    let in_lock = now + 2_000 >= utc0 && now <= utc0 + 5_000;
+                    if rtds_tw > 6_000 && tw > 0.0 && (!in_lock || latched_utc0 == utc0) {
+                        let _ = tx.send(DatedEvent {
+                            recv_ns: now_ns(),
+                            event: Event::Twap {
+                                ts_ms: now,
+                                value: tw,
+                            },
+                        });
+                    }
+                }
+                Err(e) if last_warn.elapsed() > Duration::from_secs(20) => {
+                    tracing::warn!(error = %e, "chainlink spot overlay");
+                    last_warn = Instant::now();
+                }
+                Err(_) => {}
             }
         }
-        if !yes.is_empty() && yes != "0" {
-            if let Ok((yb, ya, depth)) = clob_book(&http, &yes).await {
+        if !rest_yes.is_empty() && rest_yes != "0" {
+            if let Ok((yb, ya, depth)) = clob_book(&http, &rest_yes).await {
                 let _ = tx.send(DatedEvent {
                     recv_ns: now_ns(),
                     event: Event::Book {
@@ -490,6 +541,10 @@ pub async fn run_rest_feeds(
             r = assets_rx.changed() => {
                 if r.is_err() {
                     return;
+                }
+                let (y, _) = assets_rx.borrow().clone();
+                if !y.is_empty() && y != "0" {
+                    rest_yes = y;
                 }
             }
         }
@@ -600,5 +655,60 @@ mod tests {
         assert!((tick["twap"].as_f64().unwrap() - 81547.0).abs() < 1e-9);
         assert!((tick["binance"].as_f64().unwrap() - 81650.0).abs() < 1e-9);
         assert!((tick["k_t"].as_f64().unwrap() - 81520.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn merge_keeps_fresh_rtds_chainlink() {
+        let mut tick = json!({
+            "binance": 81650.0,
+            "chainlink": 81520.4,
+            "twap": 81518.0,
+            "ts": 19_000
+        });
+        let o = Overlay {
+            ts_ms: 19_400,
+            binance: 81651.0,
+            chainlink: 81400.0,
+            twap: 81400.0,
+            ..Overlay::default()
+        };
+        merge_tick(&mut tick, &o);
+        assert!((tick["chainlink"].as_f64().unwrap() - 81520.4).abs() < 1e-9);
+        assert!((tick["twap"].as_f64().unwrap() - 81518.0).abs() < 1e-9);
+        assert!((tick["binance"].as_f64().unwrap() - 81650.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn merge_refreshes_stale_binance_and_yes_no() {
+        let mut tick = json!({
+            "binance": 81783.0,
+            "chainlink": 81702.0,
+            "twap": 81700.0,
+            "yes_bid": 0.18,
+            "yes_ask": 0.19,
+            "no_bid": 0.81,
+            "no_ask": 0.82,
+            "s_hat": 81783.0,
+            "k_t": 81739.0,
+            "ts": 1
+        });
+        let o = Overlay {
+            ts_ms: 20_000,
+            binance: 81810.5,
+            chainlink: 81705.0,
+            twap: 81703.0,
+            s_hat: 81810.5,
+            yes_bid: 0.61,
+            yes_ask: 0.62,
+            no_bid: 0.38,
+            no_ask: 0.39,
+            k_t: 81755.0,
+            ..Overlay::default()
+        };
+        merge_tick(&mut tick, &o);
+        assert!((tick["binance"].as_f64().unwrap() - 81810.5).abs() < 1e-9);
+        assert!((tick["yes_bid"].as_f64().unwrap() - 0.61).abs() < 1e-9);
+        assert!((tick["no_ask"].as_f64().unwrap() - 0.39).abs() < 1e-9);
+        assert!((tick["k_t"].as_f64().unwrap() - 81755.0).abs() < 1e-9);
     }
 }

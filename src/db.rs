@@ -231,7 +231,7 @@ impl App {
                         "baseAmount": g.base_amount,
                         "maxNet": g.max_net,
                         "paperCashUsd": PAPER_CASH,
-                        "hedge": true,
+                        "hedge": false,
                         "paper": true,
                         "live": false,
                         "halted": false,

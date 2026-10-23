@@ -249,24 +249,39 @@ fn parse_iso_ms(s: &str) -> Option<u64> {
     let mo: u32 = ds.next()?.parse().ok()?;
     let d: u32 = ds.next()?.parse().ok()?;
     let rest = rest.trim_end_matches('Z');
-    let (hms, off) = if let Some(i) = rest.find('+') {
-        (&rest[..i], 0i64)
+    let (hms, off_secs) = if let Some(i) = rest.find('+') {
+        (&rest[..i], parse_hhmm_offset(&rest[i + 1..])?)
     } else if let Some(i) = rest.rfind('-') {
         if i > 2 {
-            (&rest[..i], 0)
+            (&rest[..i], -parse_hhmm_offset(&rest[i + 1..])?)
         } else {
-            (rest, 0)
+            (rest, 0i64)
         }
     } else {
-        (rest, 0)
+        (rest, 0i64)
     };
     let mut ts = hms.split(':');
     let h: u32 = ts.next()?.parse().ok()?;
     let mi: u32 = ts.next()?.parse().ok()?;
     let se: f64 = ts.next().unwrap_or("0").parse().unwrap_or(0.0);
     let days = days_from_civil(y, mo, d)?;
-    let unix = days * 86400 + i64::from(h) * 3600 + i64::from(mi) * 60 + se as i64 + off;
+    let unix = days * 86400 + i64::from(h) * 3600 + i64::from(mi) * 60 + se as i64 - off_secs;
     Some((unix as u64) * 1000)
+}
+
+fn parse_hhmm_offset(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Some(0);
+    }
+    let (h, m) = if let Some((a, b)) = s.split_once(':') {
+        (a.parse::<i64>().ok()?, b.parse::<i64>().unwrap_or(0))
+    } else if s.len() >= 4 {
+        (s[..2].parse().ok()?, s[2..4].parse().ok()?)
+    } else {
+        (s.parse::<i64>().ok()?, 0)
+    };
+    Some(h * 3600 + m * 60)
 }
 
 fn days_from_civil(y: i64, m: u32, d: u32) -> Option<i64> {
@@ -405,6 +420,8 @@ mod tests {
         // 2026-03-09T16:10:00Z = 1773072600
         let ms = parse_iso_ms("2026-03-09T16:10:00Z").unwrap();
         assert_eq!(ms, 1_773_072_600_000);
+        let zoned = parse_iso_ms("2026-03-09T12:10:00-04:00").unwrap();
+        assert_eq!(zoned, 1_773_072_600_000);
     }
 
     #[test]

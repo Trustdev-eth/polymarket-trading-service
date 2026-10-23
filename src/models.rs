@@ -68,7 +68,7 @@ pub struct Member {
     pub live: bool,
     #[serde(default = "default_true")]
     pub paper: bool,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub hedge: bool,
     #[serde(default = "default_base", rename = "baseAmount")]
     pub base_amount: f64,
@@ -89,6 +89,15 @@ pub struct Member {
     pub keys: Option<KeysDoc>,
     #[serde(default, rename = "createdAt")]
     pub created_at: Option<BsonDateTime>,
+    /// Set when paper or live is started. PnL / heatmap count from this instant.
+    #[serde(default, rename = "sessionStartedAt")]
+    pub session_started_at: Option<BsonDateTime>,
+    /// "paper" or "live" for the session that `session_started_at` belongs to.
+    #[serde(default, rename = "sessionMode")]
+    pub session_mode: String,
+    /// Polymarket funder portfolio USD at live session start (wallet PnL baseline).
+    #[serde(default, rename = "sessionStartBalance")]
+    pub session_start_balance: Option<f64>,
 }
 
 fn default_true() -> bool {
@@ -98,7 +107,7 @@ fn default_base() -> f64 {
     5.0
 }
 fn default_net() -> f64 {
-    15.0
+    0.0
 }
 
 impl Member {
@@ -123,6 +132,12 @@ impl Member {
 
     pub fn paper_cash(&self) -> f64 {
         self.paper_cash_usd.unwrap_or(crate::config::PAPER_CASH)
+    }
+
+    pub fn session_started_ms(&self) -> i64 {
+        self.session_started_at
+            .map(|d| d.timestamp_millis())
+            .unwrap_or(0)
     }
 
     pub fn run_flags_at(&self, now_ms: i64) -> crate::access::RunFlags {
@@ -416,6 +431,8 @@ pub struct FillRow {
     pub px: f64,
     pub kind: String,
     pub paper: bool,
+    #[serde(default)]
+    pub slug: String,
 }
 
 /// One live POST. Tokyo sends a whole wave so the UK box can fan out together.

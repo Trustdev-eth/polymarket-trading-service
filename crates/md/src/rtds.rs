@@ -2,10 +2,36 @@ use anyhow::Result;
 #[cfg(not(windows))]
 use futures_util::{SinkExt, StreamExt};
 use mm_engine::Event;
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(windows))]
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{now_ns, DatedEvent, EventTx, RTDS_CHAINLINK_TOPIC, RTDS_TWAP_TOPIC, RTDS_WS};
+
+static LAST_CHAINLINK_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_TWAP_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Age of the last Polymarket RTDS Chainlink print. `u64::MAX` if none yet.
+pub fn chainlink_age_ms(now_ms: u64) -> u64 {
+    age_since(LAST_CHAINLINK_MS.load(Ordering::Relaxed), now_ms)
+}
+
+/// Age of the last Polymarket RTDS 60s TWAP print. `u64::MAX` if none yet.
+pub fn twap_age_ms(now_ms: u64) -> u64 {
+    age_since(LAST_TWAP_MS.load(Ordering::Relaxed), now_ms)
+}
+
+fn age_since(last: u64, now_ms: u64) -> u64 {
+    if last == 0 {
+        u64::MAX
+    } else {
+        now_ms.saturating_sub(last)
+    }
+}
+
+fn mark(slot: &AtomicU64) {
+    slot.store(now_ns() / 1_000_000, Ordering::Relaxed);
+}
 
 const PING_S: u64 = 5;
 const IDLE_S: u64 = 8;
@@ -149,8 +175,14 @@ pub fn parse_rtds(txt: &str, symbol: &str) -> Option<Event> {
             .and_then(|s| s.parse().ok())
     })?;
     match topic {
-        t if t == RTDS_TWAP_TOPIC => Some(Event::Twap { ts_ms: ts, value }),
-        t if t == RTDS_CHAINLINK_TOPIC => Some(Event::Chainlink { ts_ms: ts, value }),
+        t if t == RTDS_TWAP_TOPIC => {
+            mark(&LAST_TWAP_MS);
+            Some(Event::Twap { ts_ms: ts, value })
+        }
+        t if t == RTDS_CHAINLINK_TOPIC => {
+            mark(&LAST_CHAINLINK_MS);
+            Some(Event::Chainlink { ts_ms: ts, value })
+        }
         _ => None,
     }
 }

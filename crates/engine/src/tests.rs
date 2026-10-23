@@ -31,6 +31,7 @@ fn ready(s_hat: f64) -> Engine {
     let s = &mut eng.state;
     s.s_hat = s_hat;
     s.fast_mid = s_hat;
+    s.binance_mid = s_hat;
     s.bba_ts_ms = NOW;
     s.bba_from_binance = true;
     s.twap = 100.0;
@@ -41,6 +42,12 @@ fn ready(s_hat: f64) -> Engine {
     s.book_mid = 0.50;
     s.book_ts_ms = NOW;
     s.chainlink_ts_ms = NOW;
+    eng
+}
+
+fn ready_hedge(s_hat: f64) -> Engine {
+    let mut eng = ready(s_hat);
+    eng.cfg.hedge = true;
     eng
 }
 
@@ -75,15 +82,15 @@ fn submits(out: &[Command], kind: IntentKind) -> Vec<OrderIntent> {
 #[test]
 fn course_defaults() {
     let cfg = EngineConfig::for_mins(15);
-    assert_eq!((cfg.no_quote_s, cfg.no_hedge_s), (60.0, 15.0));
+    assert_eq!((cfg.no_quote_s, cfg.no_hedge_s), (40.0, 15.0));
     assert_eq!((cfg.fiber_trip_ms, cfg.order_serve_ms), (90, 25));
     assert_eq!(cfg.book_ingest_ms(), cfg.fiber_trip_ms + cfg.order_serve_ms + 10);
     assert_eq!(cfg.taker_bump_ms, 250);
     assert_eq!(cfg.hedge_tick_ms, 500);
     assert_eq!(cfg.var_sample_ticks, 100);
-    assert!(cfg.hedge);
-    assert_eq!(cfg.max_net, 15.0);
-    assert_eq!(cfg.net_cap(), 15.0);
+    assert!(!cfg.hedge);
+    assert_eq!(cfg.max_net, 0.0);
+    assert_eq!(cfg.net_cap(), f64::INFINITY);
     assert_eq!((cfg.px_lo, cfg.px_hi), (1, 99));
     assert_eq!(cfg.book_stale_ms, 3_000);
 }
@@ -103,6 +110,7 @@ fn load_contract_waits_for_book_then_cools_down() {
 fn roll_cancels_all_and_resets_position() {
     let mut eng = ready(100.0);
     eng.state.position.add(TokenRef::Yes, 0.5, 5.0, 0.0);
+    eng.state.halt_until_ms = UTC1 + 10_000;
     let mut next = contract(100.0);
     next.utc0_ms = UTC1;
     next.utc1_ms = UTC1 + 900_000;
@@ -110,6 +118,17 @@ fn roll_cancels_all_and_resets_position() {
     assert!(out.contains(&Command::CancelAll { reason: CancelReason::Halt }));
     assert_eq!(eng.state.position.net(), 0.0);
     assert_eq!(eng.state.allow, AllowTrade::WaitingBook);
+    assert_eq!(eng.state.halt_until_ms, 0);
+}
+
+#[test]
+fn chainlink_fallback_does_not_print_as_binance() {
+    let mut eng = ready(101.0);
+    eng.state.bba_from_binance = false;
+    eng.state.bba_ts_ms = NOW - 10_000;
+    eng.on_event(Event::Chainlink { ts_ms: NOW, value: 99.0 }, NOW);
+    assert!((eng.state.binance_mid - 101.0).abs() < 1e-9);
+    assert!((eng.market_snap(NOW).binance_mid - 101.0).abs() < 1e-9);
 }
 
 #[test]
@@ -199,6 +218,7 @@ fn taker_respects_retry_dedup_and_max_net() {
     assert!(submits(&run(&mut eng, NOW + 400), IntentKind::Taker).is_empty(), "same price is deduped");
 
     eng.state.last_take_p = 0;
+    eng.cfg.max_net = 15.0;
     eng.state.position.add(TokenRef::Yes, 0.52, eng.cfg.max_net, 0.0);
     assert!(submits(&run(&mut eng, NOW + 800), IntentKind::Taker).is_empty(), "max_net gate");
 }
@@ -217,7 +237,7 @@ fn max_net_zero_does_not_cap() {
 
 #[test]
 fn hedge_off_skips_and_cancels_resting() {
-    let mut eng = ready(100.0);
+    let mut eng = ready_hedge(100.0);
     eng.bands.push(band(700.0));
     eng.state.position.add(TokenRef::Yes, 0.5, 5.0, 0.0);
     let h = submits(&run(&mut eng, NOW), IntentKind::Hedge)[0];
@@ -234,7 +254,7 @@ fn hedge_off_skips_and_cancels_resting() {
 
 #[test]
 fn hedge_one_in_flight_sized_to_net_at_cadence() {
-    let mut eng = ready(100.0);
+    let mut eng = ready_hedge(100.0);
     eng.bands.push(band(700.0));
     eng.state.position.add(TokenRef::Yes, 0.5, 3.0, 0.0);
 
@@ -254,7 +274,7 @@ fn hedge_one_in_flight_sized_to_net_at_cadence() {
 
 #[test]
 fn hedge_never_crosses_past_touch() {
-    let mut eng = ready(100.0);
+    let mut eng = ready_hedge(100.0);
     eng.bands.push(band(700.0));
     eng.state.position.add(TokenRef::No, 0.5, 50.0, 0.0);
     let h = submits(&run(&mut eng, NOW), IntentKind::Hedge);
@@ -263,7 +283,7 @@ fn hedge_never_crosses_past_touch() {
 
 #[test]
 fn hedge_replaces_on_price_change_and_cancels_when_flat() {
-    let mut eng = ready(100.0);
+    let mut eng = ready_hedge(100.0);
     eng.bands.push(band(700.0));
     eng.state.position.add(TokenRef::Yes, 0.5, 5.0, 0.0);
     let h = submits(&run(&mut eng, NOW), IntentKind::Hedge)[0];
@@ -298,7 +318,7 @@ fn hedge_replaces_on_price_change_and_cancels_when_flat() {
 
 #[test]
 fn lock_in_cancels_everything() {
-    let mut eng = ready(100.0);
+    let mut eng = ready_hedge(100.0);
     eng.bands.push(band(700.0));
     eng.state.position.add(TokenRef::Yes, 0.5, 5.0, 0.0);
     let h = submits(&run(&mut eng, NOW), IntentKind::Hedge)[0];
@@ -312,7 +332,7 @@ fn lock_in_cancels_everything() {
 
 #[test]
 fn no_takes_inside_no_quote_but_hedges_continue() {
-    let mut eng = ready(100.02);
+    let mut eng = ready_hedge(100.02);
     eng.state.yes_ask = 0.52;
     eng.bands.push(Band { expires_ms: UTC1, ..band(700.0) });
     eng.state.position.add(TokenRef::No, 0.5, 5.0, 0.0);

@@ -37,13 +37,13 @@ pub fn caps_for_plan(plan: &str) -> PlanCaps {
             plan: "month",
             base: MONTH_BASE,
             max_net: MONTH_NET,
-            hedge: true,
+            hedge: false,
         },
         _ => PlanCaps {
             plan: "test",
             base: TEST_BASE,
             max_net: TEST_NET,
-            hedge: true,
+            hedge: false,
         },
     }
 }
@@ -53,7 +53,7 @@ pub fn house_best(plan: &str) -> PlanCaps {
         plan: if plan == "month" { "month" } else { "test" },
         base: HOUSE_BASE,
         max_net: HOUSE_NET,
-        hedge: true,
+        hedge: false,
     }
 }
 
@@ -77,7 +77,12 @@ pub fn clamp_settings(
     }
     let caps = caps_for_plan(plan);
     let base = round1(base).clamp(MIN_BASE, caps.base);
-    let max_net = round1(max_net).clamp(base, caps.max_net);
+    // MAX_NET=0 means uncapped (hold FAK inventory to settlement).
+    let max_net = if max_net <= 0.0 {
+        0.0
+    } else {
+        round1(max_net).clamp(base, caps.max_net)
+    };
     Ok((base, max_net, hedge))
 }
 
@@ -152,6 +157,9 @@ pub fn sheet(
 
 /// Suggested MAX_NET for a chosen BASE, same ratio as house best, inside the cap.
 pub fn net_for_base(plan: &str, base: f64) -> f64 {
+    if HOUSE_NET <= 0.0 {
+        return 0.0;
+    }
     let caps = caps_for_plan(plan);
     let base = round1(base).clamp(MIN_BASE, caps.base);
     let ratio = caps.max_net / caps.base;
@@ -212,7 +220,8 @@ mod tests {
         assert_eq!(m.max_net, 150.0);
         let best = house_best("month");
         assert_eq!(best.base, 5.0);
-        assert_eq!(best.max_net, 15.0);
+        assert_eq!(best.max_net, 0.0);
+        assert!(!best.hedge);
     }
 
     #[test]
@@ -251,8 +260,8 @@ mod tests {
 
     #[test]
     fn net_follows_house_ratio() {
-        assert_eq!(net_for_base("month", 5.0), 15.0);
-        assert_eq!(net_for_base("test", 5.0), 15.0);
+        assert_eq!(net_for_base("month", 5.0), 0.0);
+        assert_eq!(net_for_base("test", 5.0), 0.0);
     }
 
     #[test]

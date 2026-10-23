@@ -4,8 +4,21 @@ use reqwest::Client;
 use serde_json::Value;
 
 const VALUE_URL: &str = "https://data-api.polymarket.com/value";
+const POSITIONS_URL: &str = "https://data-api.polymarket.com/positions";
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FunderBook {
+    /// Position mark from data-api `/value`.
+    pub cash: f64,
+    /// Cash + open position value. Same as `cash` when the API only returns value.
+    pub balance: f64,
+}
 
 pub async fn funder_value(http: &Client, funder: &str) -> Result<f64, String> {
+    Ok(funder_book(http, funder).await?.balance)
+}
+
+pub async fn funder_book(http: &Client, funder: &str) -> Result<FunderBook, String> {
     let user = funder.trim();
     if user.len() < 8 {
         return Err("Missing funder address.".into());
@@ -20,7 +33,59 @@ pub async fn funder_value(http: &Client, funder: &str) -> Result<f64, String> {
         return Err(format!("data-api HTTP {}", res.status()));
     }
     let v: Value = res.json().await.map_err(|e| format!("data-api body: {e}"))?;
-    parse_value(&v).ok_or_else(|| "data-api returned no value".into())
+    let value = parse_value(&v).unwrap_or(0.0);
+    let pos = positions_value(http, user).await.unwrap_or_default();
+    let balance = if value > 0.0 {
+        value
+    } else {
+        pos.balance
+    };
+    Ok(FunderBook {
+        cash: if pos.cash > 0.0 { pos.cash } else { balance },
+        balance,
+    })
+}
+
+async fn positions_value(http: &Client, user: &str) -> Result<FunderBook, String> {
+    let url = format!("{POSITIONS_URL}?user={user}&sizeThreshold=0");
+    let res = http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("data-api positions: {e}"))?;
+    if !res.status().is_success() {
+        return Err(format!("data-api positions HTTP {}", res.status()));
+    }
+    let v: Value = res.json().await.map_err(|e| format!("data-api positions body: {e}"))?;
+    Ok(parse_positions(&v))
+}
+
+fn parse_positions(v: &Value) -> FunderBook {
+    let arr = v
+        .as_array()
+        .or_else(|| v.get("positions").and_then(|x| x.as_array()));
+    let Some(arr) = arr else {
+        return FunderBook::default();
+    };
+    let mut current = 0.0;
+    let mut any = false;
+    for item in arr {
+        if let Some(n) = item
+            .get("currentValue")
+            .and_then(|x| x.as_f64())
+            .or_else(|| item.get("current_value").and_then(|x| x.as_f64()))
+        {
+            current += n;
+            any = true;
+        }
+    }
+    if !any {
+        return FunderBook::default();
+    }
+    FunderBook {
+        cash: current,
+        balance: current,
+    }
 }
 
 pub fn parse_value(v: &Value) -> Option<f64> {
